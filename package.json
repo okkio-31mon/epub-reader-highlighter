@@ -1,7 +1,7 @@
 {
 	"name": "epub-reader-highlighter",
-	"version": "0.1.0",
-	"description": "Read EPUB files inside Obsidian with persistent, color-coded highlights, notes, and Markdown export.",
+	"version": "0.1.1",
+	"description": "Read EPUB files with persistent, color-coded highlights, notes, and Markdown export.",
 	"main": "main.js",
 	"license": "MIT",
 	"keywords": ["obsidian", "obsidian-plugin", "epub", "ebook", "highlight", "reader"],

@@ -8,9 +8,7 @@ import {
 	WorkspaceLeaf,
 	Modal,
 } from "obsidian";
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const epubjsModule = require("epubjs");
-const ePub = epubjsModule.default ?? epubjsModule;
+import ePub from "epubjs";
 
 const VIEW_TYPE_EPUB = "epub-reader-view";
 
@@ -319,9 +317,7 @@ function wrapRangeWithSpans(
 
 	const textNodes: Node[] = [];
 	const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-	let node: Node | null;
-	// eslint-disable-next-line no-cond-assign
-	while ((node = walker.nextNode())) {
+	for (let node = walker.nextNode(); node; node = walker.nextNode()) {
 		if (range.intersectsNode(node)) textNodes.push(node);
 	}
 
@@ -366,8 +362,12 @@ class EpubView extends FileView {
 		if (e.key === "ArrowLeft") this.rendition?.prev();
 		else if (e.key === "ArrowRight") this.rendition?.next();
 	};
+	panelOpen = false;
 	outsideClickHandler = () => {
-		if (this.settingsPanel) this.settingsPanel.style.display = "none";
+		if (this.settingsPanel) {
+			this.panelOpen = false;
+			this.settingsPanel.setCssStyles({ display: "none" });
+		}
 	};
 	paginated = false;
 	bgTheme = "blue-white";
@@ -406,9 +406,7 @@ class EpubView extends FileView {
 	async onLoadFile(file: TFile) {
 		this.filePath = file.path;
 		this.contentEl.empty();
-		this.contentEl.style.position = "relative";
-		this.contentEl.style.overflow = "hidden";
-		this.contentEl.style.padding = "0";
+		this.contentEl.setCssStyles({ position: "relative", overflow: "hidden", padding: "0" });
 
 		// Reading area fills the whole view; the page is full-bleed.
 		this.container = this.contentEl.createDiv({
@@ -452,13 +450,13 @@ class EpubView extends FileView {
 		});
 		this.gearBtn.onclick = (e) => {
 			e.stopPropagation();
-			const showing = this.settingsPanel.style.display !== "none";
-			this.settingsPanel.style.display = showing ? "none" : "flex";
+			this.panelOpen = !this.panelOpen;
+			this.settingsPanel.setCssStyles({ display: this.panelOpen ? "flex" : "none" });
 		};
 		this.settingsPanel.addEventListener("click", (e) => e.stopPropagation());
 		// Click anywhere outside the panel/gear closes it. registerDomEvent ties
 		// the listener to this view's lifecycle so it's cleaned up automatically.
-		this.registerDomEvent(document, "click", this.outsideClickHandler);
+		this.registerDomEvent(activeDocument, "click", this.outsideClickHandler);
 
 		const dragHandle = this.settingsPanel.createDiv({
 			attr: {
@@ -493,7 +491,7 @@ class EpubView extends FileView {
 		});
 		toggleTrack.onclick = async () => {
 			this.paginated = !this.paginated;
-			if (this.thumb) this.thumb.style.left = this.paginated ? "50%" : "0%";
+			if (this.thumb) this.thumb.setCssStyles({ left: this.paginated ? "50%" : "0%" });
 			await this.renderBook();
 		};
 
@@ -559,7 +557,7 @@ class EpubView extends FileView {
 		hiddenColorInput.value = this.customColor;
 		hiddenColorInput.addEventListener("input", () => {
 			this.customColor = hiddenColorInput.value;
-			this.customSwatch!.style.background = this.customColor;
+			this.customSwatch!.setCssStyles({ background: this.customColor });
 			this.bgTheme = "custom";
 			this.applyTheme();
 		});
@@ -604,9 +602,11 @@ class EpubView extends FileView {
 			const startTop = rect.top - parentRect.top;
 
 			const onMove = (ev: MouseEvent) => {
-				panel.style.right = "auto";
-				panel.style.left = `${startLeft + (ev.clientX - startX)}px`;
-				panel.style.top = `${startTop + (ev.clientY - startY)}px`;
+				panel.setCssStyles({
+					right: "auto",
+					left: `${startLeft + (ev.clientX - startX)}px`,
+					top: `${startTop + (ev.clientY - startY)}px`,
+				});
 			};
 			const onUp = () => {
 				window.removeEventListener("mousemove", onMove);
@@ -684,16 +684,16 @@ class EpubView extends FileView {
 			BG_THEMES.find((t) => t.id === this.bgTheme)?.color ??
 			(this.bgTheme === "custom" ? customTextColor : BG_THEMES[0].color);
 		for (const { id, el } of this.bgBtns) {
-			(el as HTMLElement).style.border = id === this.bgTheme ? `1.5px solid ${activeColor}` : "1.5px solid transparent";
+			(el as HTMLElement).setCssStyles({ border: id === this.bgTheme ? `1.5px solid ${activeColor}` : "1.5px solid transparent" });
 		}
 		if (this.customSwatch) {
-			this.customSwatch.style.border = this.bgTheme === "custom" ? `1.5px solid ${activeColor}` : "1.5px solid transparent";
+			this.customSwatch.setCssStyles({ border: this.bgTheme === "custom" ? `1.5px solid ${activeColor}` : "1.5px solid transparent" });
 		}
 	}
 
 	updatePageNav() {
-		if (this.pageIndicator) this.pageIndicator.style.display = this.paginated ? "" : "none";
-		if (this.bottomNav) this.bottomNav.style.display = this.paginated ? "flex" : "none";
+		if (this.pageIndicator) this.pageIndicator.setCssStyles({ display: this.paginated ? "block" : "none" });
+		if (this.bottomNav) this.bottomNav.setCssStyles({ display: this.paginated ? "flex" : "none" });
 	}
 
 	async ensureLocations() {
@@ -786,18 +786,15 @@ class EpubView extends FileView {
 			}
 			const img = doc.createElement("img");
 			img.src = href;
-			img.style.cssText = `display:block; margin:0 auto; max-width:100%; max-height:${maxH}px; width:auto; height:auto;`;
+			// These elements live in the book's iframe document, where Obsidian's
+			// setCssStyles helper isn't on the prototype, so set the attribute.
+			img.setAttribute("style", `display:block; margin:0 auto; max-width:100%; max-height:${maxH}px; width:auto; height:auto;`);
 			svg.replaceWith(img);
 		});
 
 		// Inline cover/content images: same contain treatment.
 		doc.querySelectorAll("img").forEach((img) => {
-			img.style.setProperty("max-width", "100%", "important");
-			img.style.setProperty("max-height", `${maxH}px`, "important");
-			img.style.setProperty("width", "auto", "important");
-			img.style.setProperty("height", "auto", "important");
-			img.style.setProperty("display", "block", "important");
-			img.style.setProperty("margin", "0 auto", "important");
+			img.setAttribute("style", `max-width:100% !important; max-height:${maxH}px !important; width:auto !important; height:auto !important; display:block !important; margin:0 auto !important;`);
 		});
 
 		// In paginated mode epub.js lays the body out as CSS columns; force a
@@ -805,9 +802,7 @@ class EpubView extends FileView {
 		// isn't split across columns.
 		const body = doc.body;
 		if (this.paginated && body && body.children.length === 1) {
-			body.style.setProperty("column-width", "auto", "important");
-			body.style.setProperty("columns", "1", "important");
-			body.style.setProperty("overflow", "hidden", "important");
+			body.setAttribute("style", `${body.getAttribute("style") ?? ""}; column-width:auto !important; columns:1 !important; overflow:hidden !important;`);
 		}
 	}
 
@@ -895,8 +890,7 @@ class EpubView extends FileView {
 		});
 		const top = (iframeRect?.top ?? 0) + rect.top - containerRect.top - 34;
 		const left = (iframeRect?.left ?? 0) + rect.left - containerRect.left;
-		toolbar.style.top = `${Math.max(top, 0)}px`;
-		toolbar.style.left = `${left}px`;
+		toolbar.setCssStyles({ top: `${Math.max(top, 0)}px`, left: `${left}px` });
 		this.colorToolbar = toolbar;
 
 		for (const c of HIGHLIGHT_COLORS) {

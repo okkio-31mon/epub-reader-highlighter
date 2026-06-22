@@ -1,9 +1,9 @@
 {
 	"id": "epub-reader-highlighter",
 	"name": "EPUB Reader and Highlighter",
-	"version": "0.1.0",
-	"minAppVersion": "1.0.0",
-	"description": "Read EPUB files inside Obsidian with persistent, color-coded highlights, notes, and Markdown export.",
+	"version": "0.1.1",
+	"minAppVersion": "1.4.0",
+	"description": "Read EPUB files with persistent, color-coded highlights, notes, and Markdown export.",
 	"author": "Aria",
 	"authorUrl": "https://github.com/okkio-31mon",
 	"isDesktopOnly": true
