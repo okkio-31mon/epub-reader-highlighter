@@ -1,6 +1,6 @@
 {
 	"id": "epub-reader-highlighter",
-	"name": "EPUB Highlighter",
+	"name": "EPUB Reader and Highlighter",
 	"version": "0.1.0",
 	"minAppVersion": "1.0.0",
 	"description": "Read EPUB files inside Obsidian with persistent, color-coded highlights, notes, and Markdown export.",

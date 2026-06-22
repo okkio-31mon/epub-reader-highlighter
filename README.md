@@ -1,4 +1,4 @@
-# EPUB Highlighter
+# EPUB Reader and Highlighter
 
 Read EPUB books directly inside Obsidian, mark them up with color-coded highlights and notes, and export everything to Markdown.
 
@@ -16,7 +16,7 @@ Read EPUB books directly inside Obsidian, mark them up with color-coded highligh
 ## Installation
 
 ### From the community store
-Search for "EPUB Highlighter" in **Settings → Community plugins → Browse**, install, and enable.
+Search for "EPUB Reader and Highlighter" in **Settings → Community plugins → Browse**, install, and enable.
 
 ### Manual
 1. Download `main.js`, `manifest.json`, and `styles.css` from the latest [release](https://github.com/okkio-31mon/epub-reader-highlighter/releases).
