@@ -1,0 +1,9 @@
+# dependencies
+node_modules/
+
+# personal reading data (highlights are per-user, never publish)
+data.json
+
+# os / editor noise
+.DS_Store
+*.log

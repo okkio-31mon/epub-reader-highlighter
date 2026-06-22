@@ -1,0 +1,11 @@
+/* Highlight spans injected into the book's iframe.
+   The background color is set inline per-highlight; static traits live here. */
+.epub-highlight {
+	cursor: pointer;
+	border-radius: 2px;
+	transition: filter 0.1s ease;
+}
+
+.epub-highlight:hover {
+	filter: brightness(0.95);
+}
