@@ -3,12 +3,27 @@ import {
 	FileView,
 	Notice,
 	Plugin,
-	Scope,
+	setIcon,
 	TFile,
 	WorkspaceLeaf,
 	Modal,
 } from "obsidian";
-import ePub from "epubjs";
+import ePub, { Book, Rendition, Contents } from "epubjs";
+
+// epub.js ships its own .d.ts, but several shapes are mistyped (e.g. `views()`
+// is declared `View[]` though it returns a `Views` collection with `.all()`,
+// and `Themes` is missing `removeOverride`). These minimal interfaces describe
+// the runtime shapes we actually use, so the rest of the code stays type-safe.
+interface EpubViewLike {
+	section?: { index: number };
+	contents?: Contents;
+}
+interface EpubViewsLike {
+	all(): EpubViewLike[];
+}
+interface EpubThemesExtra {
+	removeOverride(name: string): void;
+}
 
 const VIEW_TYPE_EPUB = "epub-reader-view";
 
@@ -94,7 +109,7 @@ export default class EpubReaderPlugin extends Plugin {
 				const view = this.app.workspace.getActiveViewOfType(EpubView);
 				if (!view) return false;
 				if (checking) return true;
-				view.ensureLocations().then(() =>
+				void view.ensureLocations().then(() =>
 					this.exportHighlights(view.file?.path ?? "", (cfi) => view.getPageLabel(cfi))
 				);
 				return true;
@@ -203,7 +218,7 @@ class HighlightListModal extends Modal {
 		this.render();
 		this.scope.register(["Mod"], "z", (evt: KeyboardEvent) => {
 			evt.preventDefault();
-			this.view.undo().then(() => this.render());
+			void this.view.undo().then(() => this.render());
 		});
 	}
 
@@ -219,9 +234,13 @@ class HighlightListModal extends Modal {
 		const record = this.view.plugin.getBookRecord(this.view.filePath);
 		const sorted = [...record.highlights].sort((a, b) => a.created - b.created);
 
-		const exportBtn = header.createEl("button", { text: "导出 Markdown" });
+		const exportBtn = header.createEl("button", { cls: "epub-export-icon-btn" });
+		setIcon(exportBtn, "upload");
+		exportBtn.setAttribute("aria-label", "导出为 Markdown");
+		exportBtn.setAttribute("title", "导出为 Markdown");
 		exportBtn.disabled = sorted.length === 0;
 		exportBtn.onclick = async () => {
+			new Notice("正在导出为 Markdown…");
 			await this.view.ensureLocations();
 			await this.view.plugin.exportHighlights(this.view.filePath, (cfi) => this.view.getPageLabel(cfi));
 			this.close();
@@ -341,8 +360,8 @@ function wrapRangeWithSpans(
 
 class EpubView extends FileView {
 	plugin: EpubReaderPlugin;
-	book: any;
-	rendition: any;
+	book: Book;
+	rendition: Rendition;
 	container: HTMLElement;
 	settingsPanel: HTMLElement;
 	gearBtn: HTMLElement;
@@ -381,14 +400,6 @@ class EpubView extends FileView {
 	constructor(leaf: WorkspaceLeaf, plugin: EpubReaderPlugin) {
 		super(leaf);
 		this.plugin = plugin;
-		// Obsidian activates this scope (taking priority over its own global
-		// Mod+Z) whenever focus is in this view but outside the book iframe.
-		this.scope = new Scope(this.app.scope);
-		this.scope.register(["Mod"], "z", (evt: KeyboardEvent) => {
-			evt.preventDefault();
-			this.undo();
-			return false;
-		});
 	}
 
 	getViewType() {
@@ -507,9 +518,9 @@ class EpubView extends FileView {
 		}
 		fontSelect.onchange = () => {
 			if (fontSelect.value) this.rendition?.themes.font(fontSelect.value);
-			else this.rendition?.themes.removeOverride("font-family");
+			else (this.rendition?.themes as unknown as EpubThemesExtra | undefined)?.removeOverride("font-family");
 		};
-		fontSelect.addEventListener("mousedown", () => this.loadSystemFonts(fontSelect));
+		fontSelect.addEventListener("mousedown", () => void this.loadSystemFonts(fontSelect));
 
 		const sizeSelect = selectRow.createEl("select", {
 			attr: { style: `${FLAT_BTN_STYLE} background: rgba(255,255,255,0.08); color: #fff; font-size: 11px; width: 100%; border-radius: 6px; padding: 3px 4px;` },
@@ -553,7 +564,7 @@ class EpubView extends FileView {
 				type: "color",
 				style: "position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; border: none; padding: 0;",
 			},
-		}) as HTMLInputElement;
+		});
 		hiddenColorInput.value = this.customColor;
 		hiddenColorInput.addEventListener("input", () => {
 			this.customColor = hiddenColorInput.value;
@@ -621,11 +632,11 @@ class EpubView extends FileView {
 		if (this.fontsLoaded) return;
 		this.fontsLoaded = true;
 		try {
-			// @ts-ignore - Local Font Access API, Chromium-only, needs a user gesture.
-			if (!window.queryLocalFonts) return;
-			// @ts-ignore
-			const fonts = await window.queryLocalFonts();
-			const names: string[] = Array.from(new Set(fonts.map((f: any) => f.family))).sort();
+			// Local Font Access API: Chromium-only, needs a user gesture, not in lib.dom.
+			const win = window as Window & { queryLocalFonts?: () => Promise<Array<{ family: string }>> };
+			if (!win.queryLocalFonts) return;
+			const fonts = await win.queryLocalFonts();
+			const names: string[] = Array.from(new Set(fonts.map((f) => f.family))).sort();
 			const current = select.value;
 			for (const n of names) {
 				select.createEl("option", { text: n, value: `"${n}"` });
@@ -684,7 +695,7 @@ class EpubView extends FileView {
 			BG_THEMES.find((t) => t.id === this.bgTheme)?.color ??
 			(this.bgTheme === "custom" ? customTextColor : BG_THEMES[0].color);
 		for (const { id, el } of this.bgBtns) {
-			(el as HTMLElement).setCssStyles({ border: id === this.bgTheme ? `1.5px solid ${activeColor}` : "1.5px solid transparent" });
+			el.setCssStyles({ border: id === this.bgTheme ? `1.5px solid ${activeColor}` : "1.5px solid transparent" });
 		}
 		if (this.customSwatch) {
 			this.customSwatch.setCssStyles({ border: this.bgTheme === "custom" ? `1.5px solid ${activeColor}` : "1.5px solid transparent" });
@@ -704,9 +715,15 @@ class EpubView extends FileView {
 		notice.hide();
 	}
 
+	// epub.js types locationFromCfi as DOM `Location`, but it returns a numeric
+	// index at runtime; centralize the cast here.
+	locationIndex(cfi: string): number {
+		return this.book.locations.locationFromCfi(cfi) as unknown as number;
+	}
+
 	getPageLabel(cfiRange: string): string {
 		if (!this.book?.locations?.length()) return "—";
-		const loc = this.book.locations.locationFromCfi(cfiRange);
+		const loc = this.locationIndex(cfiRange);
 		if (loc < 0) return "—";
 		return `${loc + 1}/${this.book.locations.length()}`;
 	}
@@ -727,7 +744,7 @@ class EpubView extends FileView {
 
 		if (this.paginated) await this.ensureLocations();
 
-		this.rendition.on("rendered", (section: any, view: any) => {
+		this.rendition.on("rendered", (section: { index: number }, view: EpubViewLike) => {
 			this.applyStoredHighlightsToSection(section.index);
 			const doc = view?.contents?.document;
 			if (doc) {
@@ -739,21 +756,18 @@ class EpubView extends FileView {
 			}
 		});
 
-		this.rendition.on("relocated", (location: any) => {
+		this.rendition.on("relocated", (location: { start: { cfi: string } }) => {
 			if (!this.pageIndicator) return;
 			if (this.paginated && this.book.locations.length()) {
-				const current = this.book.locations.locationFromCfi(location.start.cfi) + 1;
+				const current = this.locationIndex(location.start.cfi) + 1;
 				const total = this.book.locations.length();
 				this.pageIndicator.textContent = `${current}/${total}页`;
 			} else {
 				this.pageIndicator.textContent = "";
 			}
-			// Safety net: re-check every currently mounted section against stored
-			// highlights, in case a "rendered" event was missed on revisit.
-			this.reapplyAllMountedHighlights();
 		});
 
-		this.rendition.on("selected", (cfiRange: string, contents: any) => {
+		this.rendition.on("selected", (cfiRange: string, contents: Contents) => {
 			this.showColorToolbar(cfiRange, contents);
 		});
 
@@ -827,14 +841,21 @@ class EpubView extends FileView {
 		await this.plugin.saveBookData();
 	}
 
+	// `views()` returns a Views collection (with `.all()`) at runtime, though
+	// epub.js types it as `View[]`; centralize the cast here.
+	mountedViews(): EpubViewLike[] {
+		if (!this.rendition) return [];
+		return (this.rendition.views() as unknown as EpubViewsLike).all();
+	}
+
 	reapplyAllMountedHighlights() {
-		for (const view of this.rendition?.views()?.all() ?? []) {
+		for (const view of this.mountedViews()) {
 			if (view?.section) this.applyStoredHighlightsToSection(view.section.index);
 		}
 	}
 
 	unhighlightInAllViews(id: string) {
-		for (const view of this.rendition?.views()?.all() ?? []) {
+		for (const view of this.mountedViews()) {
 			const doc = view?.contents?.document;
 			doc?.querySelectorAll(`[data-hl-id="${id}"]`).forEach((span: Element) => {
 				span.replaceWith(...Array.from(span.childNodes));
@@ -844,7 +865,7 @@ class EpubView extends FileView {
 
 	applyStoredHighlightsToSection(sectionIndex: number) {
 		const record = this.plugin.getBookRecord(this.filePath);
-		const view = this.rendition.views().all().find((v: any) => v.section?.index === sectionIndex);
+		const view = this.mountedViews().find((v) => v.section?.index === sectionIndex);
 		if (!view?.contents) return;
 
 		for (const h of record.highlights) {
@@ -870,15 +891,15 @@ class EpubView extends FileView {
 		}
 	}
 
-	showColorToolbar(cfiRange: string, contents: any) {
+	showColorToolbar(cfiRange: string, contents: Contents) {
 		this.colorToolbar?.remove();
 		const selection = contents.window.getSelection();
 		const text = selection?.toString() ?? "";
-		if (!text.trim()) return;
+		if (!text.trim() || !selection) return;
 
 		const range = selection.getRangeAt(0);
 		const rect = range.getBoundingClientRect();
-		const iframeRect = (contents.document.defaultView.frameElement as HTMLElement)?.getBoundingClientRect();
+		const iframeRect = contents.document.defaultView?.frameElement?.getBoundingClientRect();
 		// toolbar is positioned relative to contentEl, so viewport coordinates
 		// must be re-based against contentEl's own offset, not the page origin.
 		const containerRect = this.contentEl.getBoundingClientRect();
@@ -921,7 +942,7 @@ class EpubView extends FileView {
 		};
 		const record = this.plugin.getBookRecord(this.filePath);
 		record.highlights.push(highlight);
-		this.plugin.saveBookData();
+		void this.plugin.saveBookData();
 
 		try {
 			const spans = wrapRangeWithSpans(

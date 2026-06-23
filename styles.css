@@ -9,3 +9,26 @@
 .epub-highlight:hover {
 	filter: brightness(0.95);
 }
+
+/* Icon-only export button in the highlights panel — transparent, theme-colored.
+   The right margin keeps it clear of the modal's built-in close (×) button. */
+.epub-export-icon-btn {
+	background: transparent;
+	border: none;
+	box-shadow: none;
+	padding: 4px;
+	margin-right: 28px;
+	cursor: pointer;
+	color: var(--text-muted);
+	display: inline-flex;
+	align-items: center;
+}
+
+.epub-export-icon-btn:hover {
+	color: var(--text-normal);
+}
+
+.epub-export-icon-btn:disabled {
+	opacity: 0.4;
+	cursor: default;
+}

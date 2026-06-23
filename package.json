@@ -1,6 +1,6 @@
 {
 	"name": "epub-reader-highlighter",
-	"version": "0.1.1",
+	"version": "0.1.2",
 	"description": "Read EPUB files with persistent, color-coded highlights, notes, and Markdown export.",
 	"main": "main.js",
 	"license": "MIT",
@@ -11,12 +11,14 @@
 	},
 	"devDependencies": {
 		"@types/node": "^20.0.0",
-		"builtin-modules": "^3.3.0",
 		"esbuild": "^0.20.0",
 		"obsidian": "latest",
 		"typescript": "^5.4.0"
 	},
 	"dependencies": {
 		"epubjs": "^0.3.93"
+	},
+	"overrides": {
+		"@xmldom/xmldom": "^0.8.10"
 	}
 }
