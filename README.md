@@ -1,6 +1,7 @@
 # EPUB Reader and Highlighter
 
-English | [简体中文](https://github.com/okkio-31mon/epub-reader-highlighter/blob/main/README.zh-CN.md) | [繁體中文](https://github.com/okkio-31mon/epub-reader-highlighter/blob/main/README.zh-TW.md) | [Italiano](https://github.com/okkio-31mon/epub-reader-highlighter/blob/main/README.it.md)
+> 其他语言 / Other languages: 简体中文 · 繁體中文 · Italiano — 见 GitHub 仓库 / see the GitHub repo:
+> https://github.com/okkio-31mon/epub-reader-highlighter
 
 Read EPUB books directly inside Obsidian, mark them up with color-coded highlights and notes, and export everything to Markdown.
 
