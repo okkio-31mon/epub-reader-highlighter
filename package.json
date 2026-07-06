@@ -1,6 +1,6 @@
 {
 	"name": "epub-reader-highlighter",
-	"version": "0.1.2",
+	"version": "0.2.0",
 	"description": "Read EPUB files with persistent, color-coded highlights, notes, and Markdown export.",
 	"main": "main.js",
 	"license": "MIT",
