@@ -278,6 +278,9 @@ const FONTS: { name: string; en: string; tw: string; it: string; value: string }
 const FLAT_BTN_STYLE =
 	"border: none; box-shadow: none; padding: 0; cursor: pointer; font-weight: 300;";
 
+// Rainbow shown on the "custom color" swatch when a preset is active.
+const RAINBOW_GRADIENT = "conic-gradient(#f43f5e, #f59e0b, #eab308, #22c55e, #3b82f6, #a855f7, #f43f5e)";
+
 export default class EpubReaderPlugin extends Plugin {
 	data: PluginData = DEFAULT_DATA;
 
@@ -943,6 +946,8 @@ class EpubView extends FileView {
 	scanPct: number | null = null;
 	// Color used by the Cmd+H shortcut; updated whenever a swatch is clicked.
 	lastColor = HIGHLIGHT_COLORS[0].value;
+	// Last hex chosen from the custom color picker (for its swatch + picker default).
+	customHlColor = "#ffd54f";
 	// Undo stack of reversible highlight actions (newest last).
 	undoStack: { type: "create" | "delete"; highlight: Highlight }[] = [];
 
@@ -1098,8 +1103,8 @@ class EpubView extends FileView {
 					};
 				}
 				const rainbow = palette.createEl("button", { cls: "epub-swatch-dot", attr: { title: tr("自定义颜色…", "Custom color…", "自訂顏色…", "Colore personalizzato…") } });
-				rainbow.setCssStyles({ background: "conic-gradient(#f43f5e, #f59e0b, #eab308, #22c55e, #3b82f6, #a855f7, #f43f5e)" });
-				rainbow.toggleClass("is-active", !HIGHLIGHT_COLORS.some((c) => c.value === this.lastColor));
+				rainbow.setCssStyles({ background: this.customColorActive() ? this.lastColor : RAINBOW_GRADIENT });
+				rainbow.toggleClass("is-active", this.customColorActive());
 				// Clicking the color wheel expands an inline picker inside this menu
 				// (toggles on repeat clicks). Picking updates the default color live;
 				// the ring on the wheel is the selection feedback, no Notice spam.
@@ -1114,7 +1119,9 @@ class EpubView extends FileView {
 						menu,
 						rgbaToHex(this.lastColor),
 						(hex) => {
+							this.customHlColor = hex;
 							this.lastColor = hexToHighlightRgba(hex);
+							rainbow.setCssStyles({ background: this.lastColor });
 							presetSws.forEach((s) => s.removeClass("is-active"));
 							rainbow.addClass("is-active");
 						},
@@ -2025,12 +2032,37 @@ class EpubView extends FileView {
 			});
 			btn.onclick = () => {
 				this.lastColor = c.value;
-				this.savePrefs();
 				this.createHighlight(cfiRange, text, c.value, range, contents.document);
 				selection.removeAllRanges();
 				this.dismissColorToolbar();
 			};
 		}
+		// Custom-color swatch: shows the rainbow until a custom color is in use, then
+		// shows that color. Clicking opens the picker and highlights with the choice.
+		const custom = toolbar.createEl("button", {
+			attr: {
+				style: `${FLAT_BTN_STYLE} width: 18px; height: 18px; border-radius: 50%; background: ${this.customColorActive() ? this.lastColor : RAINBOW_GRADIENT};`,
+				title: tr("自定义颜色…", "Custom color…", "自訂顏色…", "Colore personalizzato…"),
+			},
+		});
+		custom.onclick = () => {
+			const input = this.contentEl.createEl("input", { attr: { type: "color", style: "position:absolute; width:0; height:0; opacity:0; pointer-events:none;" } });
+			input.value = this.customHlColor;
+			input.addEventListener("change", () => {
+				this.customHlColor = input.value;
+				this.lastColor = hexToHighlightRgba(input.value);
+				this.createHighlight(cfiRange, text, this.lastColor, range, contents.document);
+				selection.removeAllRanges();
+				this.dismissColorToolbar();
+				input.remove();
+			});
+			input.click();
+		};
+	}
+
+	// Whether the active highlight color is a custom (non-preset) one.
+	private customColorActive(): boolean {
+		return !HIGHLIGHT_COLORS.some((c) => c.value === this.lastColor);
 	}
 
 	// The active text selection from whichever mounted section owns it, together
