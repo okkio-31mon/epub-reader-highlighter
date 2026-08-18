@@ -17,7 +17,10 @@ Leggi i libri EPUB direttamente dentro Obsidian, annotali con evidenziazioni col
 - **Annulla** — `Cmd/Ctrl+Z` annulla l'ultima evidenziazione o eliminazione.
 - **Temi di lettura** — cinque sfondi integrati più un selettore di colore integrato (senza finestre di sistema) per qualsiasi colore personalizzato; carattere e dimensione regolabili; il colore dei link si adatta allo sfondo per restare leggibile.
 - **Ricerca in tutto il libro** — cerca una parola in tutto il libro e salta a qualsiasi risultato.
-- **Esportazione Markdown** — esporta tutte le evidenziazioni, o solo quelle che scegli, in una nota Markdown dal menu evidenziazioni.
+- **Evidenziazione multi-pagina** — segna un punto d'inizio, gira quante pagine vuoi e concludi da una selezione successiva per evidenziare l'intero passaggio in una volta (all'interno di un capitolo).
+- **Colori usati di recente** — i colori personalizzati restano a portata di clic e spariscono dall'elenco quando nessuna evidenziazione li usa più.
+- **Esportazione Markdown** — esporta tutte le evidenziazioni o solo quelle che scegli, decidendo cartella, raggruppamento, ordinamento e quali dettagli accompagnano ogni evidenziazione. Ogni esportazione crea un nuovo file con data e ora: nulla viene mai sovrascritto.
+- **Unione delle note esportate** — fonde più esportazioni dello stesso libro in una sola: i duplicati vengono rimossi e ciò che hai scritto resta intatto. Gli originali non vengono modificati.
 - **Guida al primo avvio** — un popup una tantum spiega le icone della barra degli strumenti; lo stesso riferimento resta nella scheda impostazioni del plugin.
 
 ## Installazione
@@ -48,11 +51,23 @@ Cerca "EPUB Reader and Highlighter" in **Impostazioni → Plugin della community
 | Scorri / Pagine | Passa dalla lettura a scorrimento continuo a quella pagina per pagina. |
 | ‹ pagina › | Pagina precedente / successiva (anche con ← / →). La casella mostra pagina fissa / totale · percentuale — digita un numero e premi Invio per saltare; in modalità scorrimento mostra la percentuale di lettura. |
 | 🔍 | **Cerca** — trova una parola in tutto il libro e salta a un risultato. |
+| ✎ (matita) | **Evidenziazione multi-pagina · inizio** — segna l'inizio di un passaggio, poi gira pagina. |
+| ✎✓ (matita con spunta) | **Evidenziazione multi-pagina · fine** — evidenzia tutto tra l'inizio segnato e la selezione attuale. |
 | ⋯ | **Altro** — lingua dell'interfaccia e guida rapida. |
 
 Scorciatoie: `Cmd/Ctrl+Shift+H` evidenzia la selezione · `Cmd/Ctrl+Z` annulla.
 
 Evidenziazioni, posizioni di lettura e preferenze sono salvate nel `data.json` di questo plugin dentro il tuo vault e non lasciano mai il tuo dispositivo.
+
+## Esportare e unire
+
+Dal menu evidenziazioni scegli **Esporta selezionate…**. La riga in alto della finestra sceglie *quali* evidenziazioni esportare: «Tutte», «Oggi», «Seleziona capitolo» e un pallino per ogni colore usato dal libro (la scelta dei pallini viene ricordata per ogni libro). La riga in basso riguarda *questa* esportazione: ordinamento, cartella di destinazione e la casella «Imposta come predefinito», che li riscrive nelle impostazioni.
+
+**Esporta in Markdown**, nello stesso menu, salta la finestra ed esporta tutto.
+
+Le impostazioni dell'estensione contengono i valori predefiniti: cartella di esportazione, raggruppamento (nessuno / per capitolo / per colore), ordinamento (ordine del libro oppure ordine di evidenziazione) e gli interruttori per capitolo, numero di pagina, data, nota, nome del colore e numerazione.
+
+Poiché ogni esportazione è un file a sé con data e ora, un libro letto in più sessioni lascia più note. **Unisci le note di evidenziazioni esportate** (tavolozza dei comandi o pulsante nelle impostazioni) ne fonde quante ne vuoi in una sola: scegli le note, il raggruppamento e l'ordinamento, guarda l'anteprima e il risultato viene scritto in un nuovo file. Le evidenziazioni ripetute restano una volta sola; ciò che non corrisponde a nessuna evidenziazione — quello che hai scritto tu o una citazione che hai modificato — resta sotto «Altri contenuti». Le note di partenza non vengono mai toccate.
 
 ## Sviluppo
 

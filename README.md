@@ -1,7 +1,6 @@
 # EPUB Reader and Highlighter
 
-> 其他语言 / Other languages: 简体中文 · 繁體中文 · Italiano — 见 GitHub 仓库 / see the GitHub repo:
-> https://github.com/okkio-31mon/epub-reader-highlighter
+English | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Italiano](README.it.md)
 
 Read EPUB books directly inside Obsidian, mark them up with color-coded highlights and notes, and export everything to Markdown.
 
@@ -18,7 +17,10 @@ Read EPUB books directly inside Obsidian, mark them up with color-coded highligh
 - **Undo** — `Cmd/Ctrl+Z` reverses the last highlight or deletion.
 - **Reading themes** — five built-in backgrounds plus an inline color picker (no OS dialog) for any custom color, adjustable font and font size; link colors adapt to the background for readability.
 - **Full-book search** — find a keyword anywhere in the book and jump to any result.
-- **Markdown export** — export all highlights, or just the ones you pick, to a Markdown note from the highlights menu.
+- **Cross-page highlighting** — mark a start point, turn as many pages as you like, then finish from a later selection to highlight the whole passage in one go (within a chapter).
+- **Recently used colors** — custom colors you have picked stay one click away, and drop off the list once no highlight uses them.
+- **Markdown export** — export all highlights, or just the ones you pick, with control over the folder, grouping, sort order and which details each highlight carries. Every export is a new file stamped with the date and time, so nothing is ever overwritten.
+- **Merge exported notes** — fold several exports of the same book into a single note: duplicates are removed and everything you wrote yourself is preserved. The originals are never modified.
 - **First-run guide** — a one-time popup explains the toolbar icons; the same reference lives in the plugin's settings tab.
 
 ## Installation
@@ -49,11 +51,23 @@ Search for "EPUB Reader and Highlighter" in **Settings → Community plugins →
 | Scroll / Paged | Switch between continuous scrolling and page-by-page reading. |
 | ‹ page › | Previous / next page (← / → work too). The page box shows the fixed page / total · percent — type a number and press Enter to jump; in scroll mode it shows the progress percent. |
 | 🔍 | **Search** — find a keyword anywhere in the book and jump to a result. |
+| ✎ (pencil) | **Cross-page highlight · start** — mark the opening of a passage, then turn the page. |
+| ✎✓ (pencil, check) | **Cross-page highlight · finish** — highlight everything between the marked start and the current selection. |
 | ⋯ | **More** — interface language and the quick guide. |
 
 Shortcuts: `Cmd/Ctrl+Shift+H` highlight the selection · `Cmd/Ctrl+Z` undo.
 
 Highlights, reading positions, and preferences are stored in this plugin's `data.json` inside your vault and never leave your machine.
+
+## Exporting and merging
+
+Open the highlights menu and choose **Export selected…**. The top row of the dialog picks *which* highlights to export — "All", "Today", "Select chapter", and one chip per color the book uses (your chip choice is remembered per book). The bottom row covers *this* export: sort order, target folder, and a "Set as default" box that writes them back to the settings.
+
+**Export to Markdown** in the same menu skips the dialog and exports everything.
+
+The plugin's settings hold the defaults: export folder, grouping (none / by chapter / by color), sort order (book order or the order you highlighted), and toggles for chapter, page number, date, note, color name and numbering.
+
+Because every export is its own timestamped file, a book read over several sittings leaves several notes. **Merge exported highlight notes** (command palette, or the button in the settings) folds any of them into one: choose the notes, the grouping and the sort order, preview the result, and it is written to a new file. Duplicate highlights are kept once; anything that matches no highlight — your own writing, or a quote you edited — is preserved under "Other content". The source notes are never touched.
 
 ## Development
 

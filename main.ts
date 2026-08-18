@@ -7,8 +7,11 @@ import {
 	Setting,
 	setIcon,
 	TFile,
+	TFolder,
+	normalizePath,
 	WorkspaceLeaf,
 	Modal,
+	MarkdownRenderer,
 } from "obsidian";
 import ePub, { Book, Rendition, Contents, EpubCFI } from "epubjs";
 
@@ -93,6 +96,8 @@ interface BookRecord {
 	visualCfis?: string[];
 	visualCounts?: number[];
 	visualKey?: string;
+	// The color chips ticked last time this book was exported, restored on reopen.
+	colorFilter?: string[];
 	// Last reading position, so reopening the book (even after an Obsidian
 	// restart) returns to the same passage. CFI-based → survives layout changes.
 	lastCfi?: string;
@@ -108,11 +113,51 @@ interface ReadingPrefs {
 	// Default highlight color ("" = first preset; set after HIGHLIGHT_COLORS
 	// exists, which is declared below DEFAULT_DATA).
 	highlightColor: string;
+	// Recently used custom highlight colors (hex, newest first, max 5).
+	customHlHistory?: string[];
 }
+
+// How highlights are written out. Kept apart from ReadingPrefs because these
+// describe the exported note, not the reading experience.
+interface ExportPrefs {
+	// Vault-relative folder; "" = vault root.
+	folder: string;
+	groupBy: "reading" | "chapter" | "color";
+	// "book" = the order the passages appear in the book; "created" = the order
+	// they were highlighted.
+	sortBy: "book" | "created";
+	showChapter: boolean;
+	showPage: boolean;
+	showDate: boolean;
+	showNote: boolean;
+	showColor: boolean;
+	// A running number before each quote, so a long export stays easy to refer to.
+	showIndex: boolean;
+}
+
+const DEFAULT_EXPORT: ExportPrefs = {
+	folder: "",
+	groupBy: "reading",
+	sortBy: "created",
+	showChapter: true,
+	showPage: true,
+	showDate: true,
+	showNote: true,
+	showColor: false,
+	showIndex: true,
+};
+
+// Exports carry no markers at all: every comment syntax Obsidian has stays
+// visible in Live Preview, and a clean note matters more than exact matching —
+// merging recognises a block by its quoted text instead. These two are still
+// recognised when merging notes written by the versions that did write them.
+const HL_BEGIN = "%%epub-hl:begin%%";
+const HL_END = "%%epub-hl:end%%";
 
 interface PluginData {
 	books: Record<string, BookRecord>;
 	prefs: ReadingPrefs;
+	export?: ExportPrefs;
 	// Whether the first-run icon guide has been shown (once ever).
 	seenGuide?: boolean;
 }
@@ -131,6 +176,27 @@ const HIGHLIGHT_COLORS: { name: string; en: string; tw: string; it: string; valu
 	{ name: "粉", en: "Pink", tw: "粉", it: "Rosa", value: "rgba(255, 201, 221, 0.55)" },
 	{ name: "玫红", en: "Rose", tw: "玫紅", it: "Fucsia", value: "rgba(255, 122, 168, 0.55)" },
 ];
+
+// Reading order needs CFIs compared, which one throwaway EpubCFI can do for any
+// book without it being open.
+const CFI_COMPARER = new EpubCFI();
+function compareHighlights(a: Highlight, b: Highlight, by: ExportPrefs["sortBy"]): number {
+	if (by === "book") {
+		try {
+			const r = (CFI_COMPARER as unknown as { compare(x: string, y: string): number }).compare(a.cfiRange, b.cfiRange);
+			if (r !== 0) return r;
+		} catch {
+			// A malformed CFI just falls through to the time order below.
+		}
+	}
+	return a.created - b.created;
+}
+
+// Display name of a highlight color; custom picks have no preset name.
+function colorLabel(value: string): string {
+	const c = HIGHLIGHT_COLORS.find((x) => x.value === value);
+	return c ? tr(c.name, c.en, c.tw, c.it) : tr("自定义", "Custom", "自訂", "Personalizzato");
+}
 
 // Background themes, last one is the dark theme (gets light text + light link color).
 const BG_THEMES: { id: string; name: string; en: string; tw: string; it: string; bg: string; color: string; link: string }[] = [
@@ -278,6 +344,46 @@ const FONTS: { name: string; en: string; tw: string; it: string; value: string }
 const FLAT_BTN_STYLE =
 	"border: none; box-shadow: none; padding: 0; cursor: pointer; font-weight: 300;";
 
+// Selection-popup icons match the color dots beside them (18px).
+const TOOLBAR_ICON_PX = 18;
+// Icon buttons in that popup: no button chrome at all (the default background
+// would show as a white pill behind the icon), and a box exactly the size of
+// the dots so the icon is centred against them rather than stretched.
+const TOOLBAR_ICON_BTN_STYLE =
+	`${FLAT_BTN_STYLE} background: transparent; display: flex; align-items: center; justify-content: center; ` +
+	`width: ${TOOLBAR_ICON_PX}px; height: ${TOOLBAR_ICON_PX}px;`;
+// Both cross-page icons share this pencil, so they read as one pair; only the
+// mark at the lower right differs (a line to start, a check to finish).
+const PENCIL_PATH = "M15.5 3.5a2.12 2.12 0 0 1 3 3L8 17l-4 1 1-4Z";
+const PENCIL_MARK_START = "M14 20.5h7";
+const PENCIL_MARK_END = "m14 18.5 2.5 2.5 4.5-4.5";
+function drawPencilIcon(btn: HTMLElement, mark: string) {
+	const svg = btn.createSvg("svg", {
+		attr: {
+			xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 24 24", fill: "none",
+			stroke: "currentColor", "stroke-width": "2", "stroke-linecap": "round", "stroke-linejoin": "round",
+		},
+	});
+	svg.createSvg("path", { attr: { d: PENCIL_PATH } });
+	svg.createSvg("path", { attr: { d: mark } });
+	sizeToolbarIcon(btn);
+}
+
+function sizeToolbarIcon(btn: HTMLElement) {
+	const svg = btn.querySelector("svg");
+	if (!svg) return;
+	svg.setAttribute("width", `${TOOLBAR_ICON_PX}`);
+	svg.setAttribute("height", `${TOOLBAR_ICON_PX}`);
+	// Obsidian's .svg-icon rules otherwise shrink the icon and thin its strokes.
+	svg.style.setProperty("width", `${TOOLBAR_ICON_PX}px`);
+	svg.style.setProperty("height", `${TOOLBAR_ICON_PX}px`);
+	svg.style.setProperty("flex-shrink", "0");
+	svg.style.setProperty("stroke-width", "2");
+	// The pencil's mass sits high in its box, which reads as misaligned next to the
+	// round swatches; a nudge of a twentieth of its height settles it.
+	svg.style.setProperty("transform", "translateY(5%)");
+}
+
 // Rainbow shown on the "custom color" swatch when a preset is active.
 const RAINBOW_GRADIENT = "conic-gradient(#f43f5e, #f59e0b, #eab308, #22c55e, #3b82f6, #a855f7, #f43f5e)";
 
@@ -304,12 +410,17 @@ export default class EpubReaderPlugin extends Plugin {
 				if (!view) return false;
 				if (checking) return true;
 				void view.waitForPagination().then(() =>
-					this.exportHighlights(view.file?.path ?? "", (cfi) => view.getPageLabel(cfi))
+					this.exportHighlights(view.file?.path ?? "", (cfi) => view.getPageLabel(cfi), undefined, chapterLookup(view.book).labelOf)
 				);
 				return true;
 			},
 		});
 
+		this.addCommand({
+			id: "merge-highlight-exports",
+			name: tr("合并已导出的高亮摘录", "Merge exported highlight notes", "合併已匯出的高亮摘錄", "Unisci le note di evidenziazioni esportate"),
+			callback: () => new MergeExportsModal(this.app, this).open(),
+		});
 		this.addCommand({
 			id: "highlight-selection",
 			name: tr("高亮选中文字", "Highlight selection", "高亮選取文字", "Evidenzia la selezione"),
@@ -349,55 +460,127 @@ export default class EpubReaderPlugin extends Plugin {
 	// Builds a Markdown document from a book's highlights. `pageLabel` is
 	// optional so the command palette (which has no open view) can still export
 	// without page numbers, while the in-reader button can supply them.
-	buildHighlightsMarkdown(path: string, pageLabel?: (cfiRange: string) => string, ids?: Set<string>): string | null {
+	buildHighlightsMarkdown(
+		path: string,
+		pageLabel?: (cfiRange: string) => string,
+		ids?: Set<string>,
+		chapterLabel?: (cfiRange: string) => string
+	): string | null {
 		const record = this.data.books[path];
 		if (!record || record.highlights.length === 0) return null;
 
-		const sorted = [...record.highlights]
-			.filter((h) => !ids || ids.has(h.id))
-			.sort((a, b) => a.created - b.created);
-		if (sorted.length === 0) return null;
+		const ep = this.exportPrefs;
+		const picked = ids ? record.highlights.filter((h) => ids.has(h.id)) : record.highlights;
+		if (picked.length === 0) return null;
+		const sorted = [...picked].sort((a, b) => compareHighlights(a, b, ep.sortBy));
+
 		// The book name is already the file (note) title, so the H1 omits it to
 		// avoid showing the name twice.
 		const title = tr("高亮摘录", "Highlights", "高亮摘錄", "Evidenziazioni");
 		const count = tr(`共 ${sorted.length} 条高亮`, `${sorted.length} highlights`, `共 ${sorted.length} 條高亮`, `${sorted.length} evidenziazioni`);
 		const lines: string[] = [`# ${title}`, "", `> ${count}`, ""];
+
+		// One group per chapter or color; reading order keeps a single unnamed group.
+		const groups = new Map<string, Highlight[]>();
 		for (const h of sorted) {
-			const page = pageLabel?.(h.cfiRange);
-			const heading =
-				page && page !== "—"
-					? tr(`第 ${page} 页`, `Page ${page}`, `第 ${page} 頁`, `Pagina ${page}`)
-					: new Date(h.created).toLocaleDateString();
-			lines.push(`## ${heading}`);
-			lines.push("");
-			lines.push(`> ${h.text.replace(/\n+/g, " ")}`);
-			lines.push("");
-			if (h.note) {
-				lines.push(`**${tr("备注", "Note", "備註", "Nota")}：** ${h.note}`);
+			const key =
+				ep.groupBy === "chapter"
+					? chapterLabel?.(h.cfiRange) || tr("未知章节", "Unknown chapter", "未知章節", "Capitolo sconosciuto")
+					: ep.groupBy === "color"
+						? colorLabel(h.color)
+						: "";
+			const bucket = groups.get(key);
+			if (bucket) bucket.push(h);
+			else groups.set(key, [h]);
+		}
+
+		let n = 0;
+		for (const [key, items] of groups) {
+			if (key) lines.push(`## ${key}`, "");
+			for (const h of items) {
+				n++;
+				const num = ep.showIndex ? `**${n}.** ` : "";
+				lines.push(`> ${num}${h.text.replace(/\n+/g, " ")}`);
 				lines.push("");
+				if (ep.showNote && h.note) {
+					lines.push(`**${tr("备注", "Note", "備註", "Nota")}：** ${h.note}`);
+					lines.push("");
+				}
+				// Meta line: only the fields that aren't already the group heading.
+				const meta: string[] = [];
+				if (ep.showChapter && ep.groupBy !== "chapter") {
+					const c = chapterLabel?.(h.cfiRange);
+					if (c) meta.push(c);
+				}
+				if (ep.showPage) {
+					const page = pageLabel?.(h.cfiRange);
+					if (page && page !== "—") meta.push(tr(`第 ${page} 页`, `Page ${page}`, `第 ${page} 頁`, `Pagina ${page}`));
+				}
+				if (ep.showDate) meta.push(new Date(h.created).toLocaleDateString());
+				if (ep.showColor && ep.groupBy !== "color") meta.push(colorLabel(h.color));
+				if (meta.length) lines.push(`*${meta.join(" · ")}*`, "");
+				lines.push("---", "");
 			}
-			lines.push("---");
-			lines.push("");
 		}
 		return lines.join("\n");
 	}
 
-	async exportHighlights(path: string, pageLabel?: (cfiRange: string) => string, ids?: Set<string>) {
-		const markdown = this.buildHighlightsMarkdown(path, pageLabel, ids);
+	get exportPrefs(): ExportPrefs {
+		if (!this.data.export) this.data.export = { ...DEFAULT_EXPORT };
+		return this.data.export;
+	}
+
+	async exportHighlights(
+		path: string,
+		pageLabel?: (cfiRange: string) => string,
+		ids?: Set<string>,
+		chapterLabel?: (cfiRange: string) => string,
+		folderOverride?: string
+	) {
+		const markdown = this.buildHighlightsMarkdown(path, pageLabel, ids, chapterLabel);
 		if (markdown === null) {
 			new Notice(tr("这本书还没有任何高亮记录", "This book has no highlights yet", "這本書還沒有任何高亮記錄", "Questo libro non ha ancora evidenziazioni"));
 			return;
 		}
 		const bookName = path.split("/").pop()?.replace(/\.epub$/i, "") ?? "epub";
-		const outPath = tr(`${bookName} - 高亮摘录.md`, `${bookName} - Highlights.md`, `${bookName} - 高亮摘錄.md`, `${bookName} - Evidenziazioni.md`);
-		const existing = this.app.vault.getAbstractFileByPath(outPath);
-		let file: TFile;
-		if (existing instanceof TFile) {
-			await this.app.vault.modify(existing, markdown);
-			file = existing;
-		} else {
-			file = await this.app.vault.create(outPath, markdown);
+		const folder = await this.ensureExportFolder(folderOverride);
+		if (folder === null) return;
+		const name = tr(
+			`${bookName} - 高亮摘录`,
+			`${bookName} - Highlights`,
+			`${bookName} - 高亮摘錄`,
+			`${bookName} - Evidenziazioni`
+		);
+		await this.writeStampedNote(name, markdown, folder);
+	}
+
+	// Resolve the export folder, creating it when missing. null = it can't be made.
+	async ensureExportFolder(folderOverride?: string): Promise<string | null> {
+		const folder = (folderOverride ?? this.exportPrefs.folder).replace(/^\/+|\/+$/g, "");
+		if (folder && !(this.app.vault.getAbstractFileByPath(folder) instanceof TFolder)) {
+			try {
+				await this.app.vault.createFolder(folder);
+			} catch {
+				new Notice(tr(`无法创建文件夹「${folder}」`, `Could not create folder "${folder}"`, `無法建立資料夾「${folder}」`, `Impossibile creare la cartella "${folder}"`));
+				return null;
+			}
 		}
+		return folder;
+	}
+
+	// Every export and every merge lands in its own file, stamped to the minute,
+	// so nothing existing is ever overwritten.
+	async writeStampedNote(name: string, markdown: string, folder: string) {
+		const d = new Date();
+		const pad = (n: number) => `${n}`.padStart(2, "0");
+		const stamp = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
+		const stem = `${name} ${stamp}`.replace(/[\\/:*?"<>|]/g, "-");
+		const dir = folder ? `${folder}/` : "";
+		let outPath = normalizePath(`${dir}${stem}.md`);
+		for (let n = 2; this.app.vault.getAbstractFileByPath(outPath); n++) {
+			outPath = normalizePath(`${dir}${stem} (${n}).md`);
+		}
+		const file = await this.app.vault.create(outPath, markdown);
 		new Notice(tr(`已导出到「${outPath}」`, `Exported to "${outPath}"`, `已匯出到「${outPath}」`, `Esportato in "${outPath}"`));
 		await this.app.workspace.getLeaf(true).openFile(file);
 	}
@@ -437,13 +620,119 @@ class EpubSettingTab extends PluginSettingTab {
 				});
 			});
 
+		// ---- Export ----
+		new Setting(containerEl).setName(tr("导出", "Export", "匯出", "Esportazione")).setHeading();
+		const ep = this.plugin.exportPrefs;
+
+		new Setting(containerEl)
+			.setName(tr("导出文件夹", "Export folder", "匯出資料夾", "Cartella di esportazione"))
+			.setDesc(
+				tr(
+					"留空 = 库根目录。可直接粘贴库内相对路径，或点右侧图标浏览。在这里改是全局的，之后每次导出都用它；在导出弹窗里改则只影响那一次，除非勾选「设为默认」。",
+					"Empty = vault root. Paste a vault-relative path, or browse with the icon. Changing it here is global and applies to every later export; changing it in the export dialog affects that one export only, unless “set as default” is ticked.",
+					"留空 = 庫根目錄。可直接貼上庫內相對路徑，或點右側圖示瀏覽。在這裡改是全域的，之後每次匯出都用它；在匯出彈窗裡改則只影響那一次，除非勾選「設為預設」。",
+					"Vuoto = radice. Incolla un percorso relativo o sfoglia con l'icona. Qui la modifica è globale e vale per ogni esportazione successiva; nella finestra di esportazione vale solo per quella volta, salvo spuntare «imposta come predefinito»."
+				)
+			)
+			.addText((t) => {
+				t.setPlaceholder(tr("库根目录", "Vault root", "庫根目錄", "Radice della cassaforte"));
+				t.setValue(ep.folder);
+				t.onChange(async (v) => {
+					ep.folder = v.trim().replace(/^\/+|\/+$/g, "");
+					await this.plugin.saveBookData();
+				});
+			})
+			.addExtraButton((b) =>
+				b
+					.setIcon("folder")
+					.setTooltip(tr("浏览文件夹", "Browse folders", "瀏覽資料夾", "Sfoglia le cartelle"))
+					.onClick(() =>
+						new FolderPickerModal(this.app, async (f) => {
+							ep.folder = f;
+							await this.plugin.saveBookData();
+							this.display();
+						}).open()
+					)
+			);
+
+		new Setting(containerEl)
+			.setName(tr("分组方式", "Group by", "分組方式", "Raggruppa per"))
+			.setDesc(tr("导出的高亮如何排列。", "How exported highlights are arranged.", "匯出的高亮如何排列。", "Come sono disposte le evidenziazioni."))
+			.addDropdown((dd) => {
+				dd.addOption("reading", tr("不分组", "No grouping", "不分組", "Nessun raggruppamento"));
+				dd.addOption("chapter", tr("按章节", "By chapter", "按章節", "Per capitolo"));
+				dd.addOption("color", tr("按颜色", "By color", "按顏色", "Per colore"));
+				dd.setValue(ep.groupBy);
+				dd.onChange(async (v) => {
+					ep.groupBy = v as ExportPrefs["groupBy"];
+					await this.plugin.saveBookData();
+				});
+			});
+
+		new Setting(containerEl)
+			.setName(tr("排序方式", "Sort by", "排序方式", "Ordina per"))
+			.setDesc(
+				tr(
+					"按书中顺序 = 高亮在书里出现的先后；按划线时间 = 你标记它们的先后。",
+					"Book order = where the passages sit in the book; highlight time = the order you marked them.",
+					"按書中順序 = 高亮在書裡出現的先後；按劃線時間 = 你標記它們的先後。",
+					"Ordine del libro = dove si trovano i passaggi; ora = l'ordine in cui li hai segnati."
+				)
+			)
+			.addDropdown((dd) => {
+				dd.addOption("book", tr("按书中顺序", "Book order", "按書中順序", "Ordine del libro"));
+				dd.addOption("created", tr("按划线时间", "Highlight time", "按劃線時間", "Ora dell'evidenziazione"));
+				dd.setValue(ep.sortBy);
+				dd.onChange(async (v) => {
+					ep.sortBy = v as ExportPrefs["sortBy"];
+					await this.plugin.saveBookData();
+				});
+			});
+
+		const fields: { key: "showChapter" | "showPage" | "showDate" | "showNote" | "showColor" | "showIndex"; label: string }[] = [
+			{ key: "showChapter", label: tr("章节标题", "Chapter", "章節標題", "Capitolo") },
+			{ key: "showPage", label: tr("页码", "Page number", "頁碼", "Numero di pagina") },
+			{ key: "showDate", label: tr("日期", "Date", "日期", "Data") },
+			{ key: "showNote", label: tr("备注", "Note", "備註", "Nota") },
+			{ key: "showColor", label: tr("颜色名称", "Color name", "顏色名稱", "Nome del colore") },
+			{ key: "showIndex", label: tr("序号", "Numbering", "序號", "Numerazione") },
+		];
+		new Setting(containerEl)
+			.setName(tr("导出内容", "Fields to include", "匯出內容", "Campi da includere"))
+			.setDesc(tr("每条高亮下方要带哪些信息。", "Which details each highlight carries.", "每條高亮下方要帶哪些資訊。", "Quali dettagli accompagnano ogni evidenziazione."));
+		for (const f of fields) {
+			new Setting(containerEl).setName(f.label).addToggle((t) => {
+				t.setValue(ep[f.key]);
+				t.onChange(async (v) => {
+					ep[f.key] = v;
+					await this.plugin.saveBookData();
+				});
+			});
+		}
+
+		new Setting(containerEl)
+			.setName(tr("合并已导出的摘录", "Merge exported notes", "合併已匯出的摘錄", "Unisci le note esportate"))
+			.setDesc(
+				tr(
+					"合并同一本书的多份导出。可选择要合并哪几份、如何分组排序，生成前可预览。重复内容自动去除，其余一律保留。结果写入新文件。",
+					"Merge several exports of the same book. Choose which notes to include and how they are grouped and sorted, and preview the result before it is created. Duplicates are removed, everything else is kept. The result is written to a new file.",
+					"合併同一本書的多份匯出。可選擇要合併哪幾份、如何分組排序，產生前可預覽。重複內容自動去除，其餘一律保留。結果寫入新檔案。",
+					"Unisce più esportazioni dello stesso libro. Scegli quali note includere e come raggrupparle e ordinarle, con anteprima prima della creazione. I duplicati vengono rimossi, tutto il resto viene conservato. Il risultato è scritto in un nuovo file."
+				)
+			)
+			.addButton((b) =>
+				b.setButtonText(tr("打开", "Open", "開啟", "Apri")).onClick(() => new MergeExportsModal(this.app, this.plugin).open())
+			);
+
 		// Icon guide — the same reference shown once on first open.
 		new Setting(containerEl).setName(tr("图标说明", "Icon guide", "圖示說明", "Guida icone")).setHeading();
 		for (const e of toolbarGuide()) {
 			const s = new Setting(containerEl).setName(e.label).setDesc(e.desc);
-			if (e.icon) {
-				const iconEl = s.nameEl.createSpan({ attr: { style: "margin-left:8px; color:var(--text-muted); vertical-align:middle;" } });
-				setIcon(iconEl, e.icon);
+			s.descEl.setCssStyles({ whiteSpace: "pre-line" });
+			if (e.icon || e.mark) {
+				const iconEl = s.nameEl.createSpan({ attr: { style: "margin-left:8px; color:var(--text-muted); vertical-align:middle; display:inline-flex;" } });
+				if (e.icon) setIcon(iconEl, e.icon);
+				else if (e.mark) drawPencilIcon(iconEl, e.mark);
 			}
 		}
 	}
@@ -605,15 +894,55 @@ class HighlightListModal extends Modal {
 // Toolbar icon guide — shown once on first open (LegendModal) and always
 // available in the settings tab. `icon` is a Lucide name; entries without one
 // (e.g. the shortcut summary) render with a bullet.
-function toolbarGuide(): { icon?: string; label: string; desc: string }[] {
+function toolbarGuide(): { icon?: string; mark?: string; label: string; desc: string }[] {
 	return [
 		{ icon: "menu", label: tr("目录", "Table of contents", "目錄", "Sommario"), desc: tr("查看章节目录，点击跳转", "Browse the chapters and jump to one", "檢視章節目錄，點擊跳轉", "Sfoglia i capitoli e salta a uno di essi") },
 		{ icon: "message-square-quote", label: tr("复制引用", "Copy quote", "複製引用", "Copia citazione"), desc: tr("把选中的文字复制成「页码·时间 + 引用」格式", "Copy the selected text as a “page · time + quote” block", "把選取文字複製成「頁碼·時間 + 引用」格式", "Copia il testo selezionato come blocco “pagina · ora + citazione”") },
 		{ icon: "highlighter", label: tr("高亮菜单", "Highlights menu", "高亮選單", "Menu evidenziazioni"), desc: tr("查看全部高亮、复制全部、导出，及设置默认高光颜色", "View, copy or export all highlights, and set the default highlight color", "檢視全部高亮、複製全部、匯出，及設定預設高光顏色", "Vedi, copia o esporta tutte le evidenziazioni e imposta il colore predefinito") },
+		{
+			mark: PENCIL_MARK_START,
+			label: tr("跨页高亮 · 起点", "Cross-page highlight · start", "跨頁高亮 · 起點", "Evidenziazione multi-pagina · inizio"),
+			desc: tr(
+				"选中起点文字后点它做标记，然后翻页",
+				"Select the opening text, click to mark it, then turn the page",
+				"選取起點文字後點它做標記，然後翻頁",
+				"Seleziona il testo iniziale, segnalo, poi gira pagina"
+			),
+		},
+		{
+			mark: PENCIL_MARK_END,
+			label: tr("跨页高亮 · 结束", "Cross-page highlight · finish", "跨頁高亮 · 結束", "Evidenziazione multi-pagina · fine"),
+			desc: tr(
+				"翻页后选中终点文字，点它把中间整段高亮起来（限同一章内）",
+				"Select the closing text after turning pages and click to highlight everything between (within one chapter)",
+				"翻頁後選取終點文字，點它把中間整段高亮起來（限同一章內）",
+				"Dopo aver girato pagina seleziona il testo finale e clicca per evidenziare tutto (nello stesso capitolo)"
+			),
+		},
 		{ icon: "sliders-horizontal", label: tr("阅读设置", "Reading settings", "閱讀設定", "Impostazioni di lettura"), desc: tr("字体、字号、背景色；点色轮展开取色面板自定义颜色", "Font, text size and background; the color wheel expands an inline picker for any custom color", "字型、字級、背景色；點色輪展開取色面板自訂顏色", "Carattere, dimensione e sfondo; la ruota dei colori apre un selettore integrato") },
 		{ label: tr("滚动 / 分页", "Scroll / Paged", "捲動 / 分頁", "Scorri / Pagine"), desc: tr("切换滚动阅读或分页阅读", "Switch between scrolling and paginated reading", "切換捲動或分頁閱讀", "Passa tra lettura a scorrimento o a pagine") },
 		{ label: "‹  ›", desc: tr("上一页 / 下一页，也可用键盘方向键", "Previous / next page — the arrow keys work too", "上一頁 / 下一頁，也可用方向鍵", "Pagina precedente / successiva — anche con le frecce") },
 		{ label: tr("页码", "Pages", "頁碼", "Pagine"), desc: tr("页码按当前窗口和字号预排全书得出：总数固定、翻页只 +1，打开或改字号后短暂显示「计算中」。在页码框输入数字回车可跳页；滚动模式下显示进度百分比", "Page numbers come from pre-paginating the whole book at your window size and font: the total is fixed and each turn advances by exactly 1; “Calculating” shows briefly after opening or changing the font. Type a number in the page box to jump; scroll mode shows a progress percent instead", "頁碼按目前視窗和字級預排全書得出：總數固定、翻頁只 +1，開啟或改字級後短暫顯示「計算中」。在頁碼框輸入數字按 Enter 可跳頁；捲動模式下顯示進度百分比", "I numeri di pagina derivano dall'impaginazione dell'intero libro alla finestra e al carattere attuali: il totale è fisso e ogni pagina avanza di 1; dopo l'apertura o un cambio di carattere appare brevemente «Calcolo». Digita un numero nella casella per saltare a una pagina; in modalità scorrimento mostra la percentuale di lettura") },
+		{
+			icon: "download",
+			label: tr("导出高亮", "Exporting highlights", "匯出高亮", "Esportare le evidenziazioni"),
+			desc: tr(
+				"1. 高亮菜单 →「选择导出…」打开弹窗，上排挑要导出哪些：「全部」「今日」「章节选择」和色点（色点按书记住上次的选择）\n2. 弹窗底部的「排序」和「导出到」只影响这一次；勾「设为默认」才写回设置\n3. 插件设置里的「导出文件夹」「分组方式」「排序方式」和几个字段开关是全局默认值\n4. 高亮菜单 →「导出为 Markdown」不经过弹窗，直接导出全部\n5. 每次导出都是一个新文件，文件名带日期时间，永不覆盖旧文件",
+				"1. Highlights menu → “Export selected…” opens the dialog; the top row picks what to export: “All”, “Today”, “Select chapter” and the color chips (remembered per book)\n2. “Sort” and “Export to” at the bottom of the dialog affect that one export only; “Set as default” writes them back to settings\n3. “Export folder”, “Group by”, “Sort by” and the field toggles in the plugin settings are the global defaults\n4. Highlights menu → “Export to Markdown” skips the dialog and exports everything\n5. Every export is a new file stamped with the date and time; nothing is ever overwritten",
+				"1. 高亮選單 →「選擇匯出…」開啟彈窗，上排挑要匯出哪些：「全部」「今日」「章節選擇」和色點（色點按書記住上次的選擇）\n2. 彈窗底部的「排序」和「匯出到」只影響這一次；勾「設為預設」才寫回設定\n3. 外掛設定裡的「匯出資料夾」「分組方式」「排序方式」和幾個欄位開關是全域預設值\n4. 高亮選單 →「匯出為 Markdown」不經過彈窗，直接匯出全部\n5. 每次匯出都是一個新檔案，檔名帶日期時間，永不覆蓋舊檔",
+				"1. Menu evidenziazioni → «Esporta selezionate…» apre la finestra; la riga in alto sceglie cosa esportare: «Tutte», «Oggi», «Seleziona capitolo» e i pallini colorati (ricordati per libro)\n2. «Ordina» ed «Esporta in» in fondo alla finestra valgono solo per quella esportazione; «Imposta come predefinito» li riscrive nelle impostazioni\n3. «Cartella di esportazione», «Raggruppa per», «Ordina per» e gli interruttori dei campi nelle impostazioni sono i valori predefiniti globali\n4. Menu evidenziazioni → «Esporta in Markdown» salta la finestra ed esporta tutto\n5. Ogni esportazione crea un nuovo file con data e ora: nulla viene mai sovrascritto"
+			),
+		},
+		{
+			icon: "git-merge",
+			label: tr("合并摘录", "Merging exports", "合併摘錄", "Unire le esportazioni"),
+			desc: tr(
+				"合并同一本书的多份导出。可选择要合并哪几份、如何分组排序，生成前可预览。重复内容自动去除，其余一律保留。结果写入新文件。",
+				"Merge several exports of the same book. Choose which notes to include and how they are grouped and sorted, and preview the result before it is created. Duplicates are removed, everything else is kept. The result is written to a new file.",
+				"合併同一本書的多份匯出。可選擇要合併哪幾份、如何分組排序，產生前可預覽。重複內容自動去除，其餘一律保留。結果寫入新檔案。",
+				"Unisce più esportazioni dello stesso libro. Scegli quali note includere e come raggrupparle e ordinarle, con anteprima prima della creazione. I duplicati vengono rimossi, tutto il resto viene conservato. Il risultato è scritto in un nuovo file."
+			),
+		},
 		{ icon: "search", label: tr("搜索", "Search", "搜尋", "Cerca"), desc: tr("全书搜索关键词，点击结果跳转", "Search the whole book and jump to a result", "全書搜尋關鍵詞，點擊結果跳轉", "Cerca in tutto il libro e salta a un risultato") },
 		{ icon: "more-horizontal", label: tr("更多", "More", "更多", "Altro"), desc: tr("界面语言和使用说明", "Interface language and this quick guide", "介面語言和使用說明", "Lingua dell'interfaccia e questa guida") },
 		{ label: tr("自动保存", "Auto-save", "自動儲存", "Salvataggio"), desc: tr("阅读位置、偏好和高亮都会自动保存，重新打开回到上次读到的地方", "Reading position, preferences and highlights are saved automatically; reopening returns to where you left off", "閱讀位置、偏好和高亮都會自動儲存，重新開啟回到上次讀到的地方", "Posizione di lettura, preferenze ed evidenziazioni si salvano da sole; alla riapertura torni dove avevi lasciato") },
@@ -635,10 +964,11 @@ class LegendModal extends Modal {
 			const row = contentEl.createDiv({ attr: { style: "display:flex; gap:10px; align-items:flex-start; padding:6px 0;" } });
 			const iconBox = row.createDiv({ attr: { style: "width:22px; flex-shrink:0; display:flex; justify-content:center; color:var(--text-normal);" } });
 			if (e.icon) setIcon(iconBox, e.icon);
+			else if (e.mark) drawPencilIcon(iconBox, e.mark);
 			else iconBox.setText(e.label.length <= 4 ? e.label : "•");
 			const body = row.createDiv({ attr: { style: "flex:1; min-width:0;" } });
 			body.createDiv({ text: e.label, attr: { style: "font-weight:600;" } });
-			body.createDiv({ text: e.desc, attr: { style: "font-size:12px; color:var(--text-muted);" } });
+			body.createDiv({ text: e.desc, attr: { style: "font-size:12px; color:var(--text-muted); white-space:pre-line;" } });
 		}
 		const btnRow = contentEl.createDiv({ attr: { style: "margin-top:12px; text-align:right;" } });
 		const ok = btnRow.createEl("button", { cls: "mod-cta", text: tr("知道了", "Got it", "知道了", "Ho capito") });
@@ -651,6 +981,490 @@ class LegendModal extends Modal {
 }
 
 // Pick which highlights to export to Markdown (all selected by default).
+// Chapter naming for one book: spine index of a CFI, and the TOC label for that
+// index. Used by the export filter and by chapter grouping in the export itself.
+function chapterLookup(book: Book) {
+	const spineItems = (book.spine as unknown as { spineItems?: { href: string }[] }).spineItems ?? [];
+	// Flatten the (possibly nested) TOC and match spine hrefs loosely — TOC and
+	// spine often disagree on relative path prefixes ("Text/ch1.xhtml" vs
+	// "ch1.xhtml"), which would otherwise degrade every label to "章节 N".
+	const flatToc: { href: string; label: string }[] = [];
+	const flatten = (items: { href: string; label: string; subitems?: unknown[] }[]) => {
+		for (const t of items) {
+			flatToc.push({ href: t.href.split("#")[0], label: t.label });
+			if (t.subitems?.length) flatten(t.subitems as typeof items);
+		}
+	};
+	flatten((book.navigation as unknown as { toc?: { href: string; label: string; subitems?: unknown[] }[] })?.toc ?? []);
+	const posOf = (cfi: string): number => {
+		try {
+			return (new EpubCFI(cfi) as unknown as { spinePos: number }).spinePos ?? -1;
+		} catch {
+			return -1;
+		}
+	};
+	// Resolve every TOC entry to a spine index. Matching the href strings directly
+	// fails often (the TOC and the spine disagree on path prefixes and on URL
+	// encoding), so ask the spine to resolve the href first and only fall back to
+	// string matching.
+	const unescape = (h: string) => {
+		try {
+			return decodeURIComponent(h);
+		} catch {
+			return h;
+		}
+	};
+	const spineGet = (book.spine as unknown as { get?(target: string): { index?: number } | null }).get?.bind(book.spine);
+	const labelByIndex = new Map<number, string>();
+	for (const t of flatToc) {
+		let idx = -1;
+		try {
+			idx = spineGet?.(t.href)?.index ?? -1;
+		} catch {
+			idx = -1;
+		}
+		if (idx < 0) {
+			const href = unescape(t.href);
+			idx = spineItems.findIndex((sp) => {
+				const sh = unescape(sp.href);
+				return sh === href || sh.endsWith("/" + href) || href.endsWith("/" + sh);
+			});
+		}
+		if (idx >= 0 && !labelByIndex.has(idx)) labelByIndex.set(idx, t.label.trim());
+	}
+	// A chapter split across several spine files only names its first one, so walk
+	// back to the nearest named one instead of falling straight to "Chapter N".
+	const labelAt = (pos: number): string => {
+		for (let i = pos; i >= 0; i--) {
+			const label = labelByIndex.get(i);
+			if (label) return label;
+		}
+		return tr(`章节 ${pos + 1}`, `Chapter ${pos + 1}`, `章節 ${pos + 1}`, `Capitolo ${pos + 1}`);
+	};
+	return {
+		posOf,
+		labelAt,
+		labelOf: (cfi: string) => {
+			const pos = posOf(cfi);
+			return pos >= 0 ? labelAt(pos) : "";
+		},
+	};
+}
+
+// ---- Merging exported notes ----
+
+// One block of an exported note: the highlight id it carries (from the %%hl:…%%
+// marker, or the HTML-comment one the first version wrote) and the block exactly
+// as written, so a merge can move it without rewriting it.
+interface ParsedBlock {
+	id: string | null;
+	raw: string;
+	// The group heading the block sat under, lifted out of the block so a merge
+	// can regroup freely — it's the only chapter name a chapter-grouped export
+	// carries, since that export leaves the chapter out of the meta line.
+	heading: string | null;
+}
+
+const HL_ID_RE = /%%hl:([^%\s]+)%%|<!--\s*hl:([^\s>]+)\s*-->/;
+// "{book} - Highlights[ 2026-08-18 1730]", in any of the four export languages.
+const EXPORT_NAME_RE = /^(.*?) - (?:高亮摘录|高亮摘錄|Highlights|Evidenziazioni)(?:\s|$)/;
+
+// Drop the "# Highlights" + "> N highlights" header the plugin writes itself, so
+// it isn't mistaken for something the reader added.
+function stripGeneratedHeader(text: string): string {
+	return text.replace(/^\s*#\s+[^\n]*\n+(?:>\s*[^\n]*\n+)?/, "");
+}
+
+// Split an exported note into its generated blocks and everything the reader put
+// around them. Notes written before the markers existed have no fenced region,
+// so their blocks have to be recognised by their text instead.
+function parseExportNote(content: string): { blocks: ParsedBlock[]; outside: string } {
+	const begin = content.indexOf(HL_BEGIN);
+	const end = content.indexOf(HL_END);
+	let region: string;
+	let outside = "";
+	if (begin >= 0 && end > begin) {
+		region = content.slice(begin + HL_BEGIN.length, end);
+		outside = [stripGeneratedHeader(content.slice(0, begin)), content.slice(end + HL_END.length)]
+			.map((t) => t.trim())
+			.filter(Boolean)
+			.join("\n\n");
+	} else {
+		region = stripGeneratedHeader(content);
+	}
+	const blocks = region
+		.split(/^---$/m)
+		.map((b) => b.trim())
+		.filter(Boolean)
+		.map((chunk) => {
+			const head = chunk.match(/^#{1,6}\s+([^\n]*)\n+/);
+			const raw = head ? chunk.slice(head[0].length).trim() : chunk;
+			const m = raw.match(HL_ID_RE);
+			return { id: m ? (m[1] ?? m[2]) : null, raw, heading: head ? head[1].trim() : null };
+		})
+		.filter((b) => b.raw.length > 0);
+	return { blocks, outside };
+}
+
+// A block's quoted text, whitespace stripped, for matching a marker-less block
+// back to the highlight it came from.
+function blockQuote(raw: string): string {
+	const line = raw.split("\n").find((l) => l.trimStart().startsWith(">"));
+	return (line ?? "").replace(/^\s*>\s*/, "").replace(HL_ID_RE, "").replace(/\s+/g, "");
+}
+
+// Chapter name out of a block's meta line ("*chapter · page · date · color*").
+function blockChapter(raw: string): string {
+	const line = raw.split("\n").find((l) => /^\*[^*].*\*$/.test(l.trim()));
+	if (!line) return "";
+	for (const part of line.trim().replace(/^\*|\*$/g, "").split(" · ")) {
+		if (/^(第\s|Page\s|Pagina\s)/.test(part)) continue;
+		if (/\d{4}/.test(part) && /[/\-.]/.test(part)) continue;
+		if (HIGHLIGHT_COLORS.some((c) => [c.name, c.en, c.tw, c.it].includes(part))) continue;
+		return part;
+	}
+	return "";
+}
+
+// Fold several exported notes for one book into a single new note. The sources
+// are only ever read: the result is always a new file, so nothing can be lost.
+class MergeExportsModal extends Modal {
+	private plugin: EpubReaderPlugin;
+	private books = new Map<string, TFile[]>();
+	private stem = "";
+	private picked = new Set<string>();
+	private groupBy: ExportPrefs["groupBy"];
+	private sortBy: ExportPrefs["sortBy"];
+	private preview!: HTMLElement;
+
+	constructor(app: App, plugin: EpubReaderPlugin) {
+		super(app);
+		this.plugin = plugin;
+		this.groupBy = plugin.exportPrefs.groupBy;
+		this.sortBy = plugin.exportPrefs.sortBy;
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		// Same column layout as the export dialog: only the preview scrolls, so the
+		// buttons never get pushed out of sight by a long result.
+		contentEl.setCssStyles({ display: "flex", flexDirection: "column", maxHeight: "76vh" });
+		contentEl.createEl("h3", {
+			text: tr("合并高亮摘录", "Merge highlight exports", "合併高亮摘錄", "Unisci le esportazioni"),
+			attr: { style: "margin-top: 0; flex-shrink: 0;" },
+		});
+
+		for (const f of this.app.vault.getMarkdownFiles()) {
+			const m = f.basename.match(EXPORT_NAME_RE);
+			if (!m) continue;
+			const list = this.books.get(m[1]);
+			if (list) list.push(f);
+			else this.books.set(m[1], [f]);
+		}
+		if (this.books.size === 0) {
+			contentEl.createEl("p", {
+				text: tr("库里没有找到导出的高亮摘录。", "No exported highlight notes found in the vault.", "庫裡沒有找到匯出的高亮摘錄。", "Nessuna nota di evidenziazioni trovata."),
+				attr: { style: "color: var(--text-muted);" },
+			});
+			return;
+		}
+		const names = [...this.books.keys()].sort();
+		this.stem = names[0];
+
+		const row = contentEl.createDiv({ attr: { style: "display:flex; align-items:center; gap:8px; padding:6px 0; flex-wrap:wrap; flex-shrink:0;" } });
+		row.createSpan({ text: tr("书", "Book", "書", "Libro"), attr: { style: "color:var(--text-muted);" } });
+		const bookSel = row.createEl("select", { cls: "dropdown" });
+		for (const n of names) bookSel.createEl("option", { text: n, value: n });
+		bookSel.value = this.stem;
+		row.createSpan({ text: tr("分组", "Group by", "分組", "Raggruppa"), attr: { style: "color:var(--text-muted); margin-left:8px;" } });
+		const groupSel = row.createEl("select", { cls: "dropdown" });
+		groupSel.createEl("option", { text: tr("不分组", "No grouping", "不分組", "Nessun raggruppamento"), value: "reading" });
+		groupSel.createEl("option", { text: tr("按章节", "By chapter", "按章節", "Per capitolo"), value: "chapter" });
+		groupSel.createEl("option", { text: tr("按颜色", "By color", "按顏色", "Per colore"), value: "color" });
+		groupSel.value = this.groupBy;
+		// A preview already on screen would otherwise still show the old arrangement.
+		const refreshPreview = () => {
+			if (this.preview.childElementCount) void this.renderPreview();
+		};
+		groupSel.onchange = () => {
+			this.groupBy = groupSel.value as ExportPrefs["groupBy"];
+			refreshPreview();
+		};
+		row.createSpan({ text: tr("排序", "Sort", "排序", "Ordina"), attr: { style: "color:var(--text-muted); margin-left:8px;" } });
+		const sortSel = row.createEl("select", { cls: "dropdown" });
+		sortSel.createEl("option", { text: tr("按书中顺序", "Book order", "按書中順序", "Ordine del libro"), value: "book" });
+		sortSel.createEl("option", { text: tr("按划线时间", "Highlight time", "按劃線時間", "Ora dell'evidenziazione"), value: "created" });
+		sortSel.value = this.sortBy;
+		sortSel.onchange = () => {
+			this.sortBy = sortSel.value as ExportPrefs["sortBy"];
+			refreshPreview();
+		};
+
+		const list = contentEl.createDiv({ attr: { style: "max-height:28vh; overflow:auto; border-top:1px solid var(--background-modifier-border); border-bottom:1px solid var(--background-modifier-border); padding:4px 0; flex-shrink:0;" } });
+		const renderFiles = () => {
+			list.empty();
+			this.picked.clear();
+			const files = [...(this.books.get(this.stem) ?? [])].sort((a, b) => a.stat.mtime - b.stat.mtime);
+			for (const f of files) {
+				const fileRow = list.createDiv({ attr: { style: "display:flex; gap:8px; align-items:center; padding:5px 0; cursor:pointer;" } });
+				const cb = fileRow.createEl("input", { attr: { type: "checkbox" } });
+				cb.checked = true;
+				this.picked.add(f.path);
+				fileRow.createSpan({ text: f.basename });
+				const set = (on: boolean) => {
+					cb.checked = on;
+					if (on) this.picked.add(f.path);
+					else this.picked.delete(f.path);
+				};
+				cb.onclick = (e) => {
+					e.stopPropagation();
+					set(cb.checked);
+				};
+				fileRow.onclick = () => set(!cb.checked);
+			}
+		};
+		bookSel.onchange = () => {
+			this.stem = bookSel.value;
+			renderFiles();
+			this.preview.empty();
+		};
+		renderFiles();
+
+		this.preview = contentEl.createDiv({ attr: { style: "flex:1; min-height:0; overflow:auto; padding:8px 0;" } });
+
+		const footer = contentEl.createDiv({ attr: { style: "margin-top:12px; display:flex; justify-content:flex-end; gap:8px; flex-shrink:0;" } });
+		const previewBtn = footer.createEl("button", { text: tr("预览", "Preview", "預覽", "Anteprima") });
+		previewBtn.onclick = () => void this.renderPreview();
+		const mergeBtn = footer.createEl("button", { cls: "mod-cta", text: tr("生成合并文件", "Create merged note", "產生合併檔案", "Crea la nota unita") });
+		mergeBtn.onclick = () => void this.write();
+	}
+
+	private async renderPreview() {
+		const built = await this.build();
+		this.preview.empty();
+		if (!built) return;
+		this.preview.createDiv({
+			text: built.stats,
+			attr: { style: "color:var(--text-muted); padding-bottom:8px; margin-bottom:8px; border-bottom:1px solid var(--background-modifier-border);" },
+		});
+		await MarkdownRenderer.render(this.app, built.md, this.preview.createDiv(), "", this.plugin);
+	}
+
+	private async write() {
+		const built = await this.build();
+		if (!built) return;
+		const folder = await this.plugin.ensureExportFolder();
+		if (folder === null) return;
+		const name = tr(
+			`${this.stem} - 高亮摘录 合并`,
+			`${this.stem} - Highlights merged`,
+			`${this.stem} - 高亮摘錄 合併`,
+			`${this.stem} - Evidenziazioni unite`
+		);
+		await this.plugin.writeStampedNote(name, built.md, folder);
+		this.close();
+	}
+
+	private async build(): Promise<{ md: string; stats: string } | null> {
+		const files = (this.books.get(this.stem) ?? [])
+			.filter((f) => this.picked.has(f.path))
+			.sort((a, b) => a.stat.mtime - b.stat.mtime);
+		if (files.length === 0) {
+			new Notice(tr("请先选择要合并的文件", "Pick at least one note to merge", "請先選擇要合併的檔案", "Scegli almeno una nota"));
+			return null;
+		}
+
+		// The book's own highlights supply each block's order and color, and let a
+		// marker-less block be matched back by its text. Moving an epub inside the
+		// vault leaves a record behind under the old path, so take every record
+		// carrying this book's name and use them together.
+		const known = new Map<string, Highlight>();
+		for (const [bookPath, rec] of Object.entries(this.plugin.data.books)) {
+			if ((bookPath.split("/").pop() ?? "").replace(/\.epub$/i, "") !== this.stem) continue;
+			for (const h of rec.highlights) known.set(h.id, h);
+		}
+		const byText = new Map<string, Highlight>();
+		for (const h of known.values()) byText.set(h.text.replace(/\s+/g, ""), h);
+
+		const variants = new Map<string, { block: ParsedBlock; file: TFile }[]>();
+		const loose: string[] = [];
+		const kept: string[] = [];
+		let seen = 0;
+		for (const f of files) {
+			const { blocks, outside } = parseExportNote(await this.app.vault.cachedRead(f));
+			for (const b of blocks) {
+				seen++;
+				const id = b.id ?? byText.get(blockQuote(b.raw))?.id ?? null;
+				if (!id) {
+					// Unmatched blocks keep the heading they sat under: for a section the
+					// reader wrote themselves, that heading is their own title.
+					const head = b.heading ? `### ${b.heading}\n\n` : "";
+					loose.push(`${head}${b.raw}\n\n*${tr("来自", "From", "來自", "Da")} [[${f.basename}]]*`);
+					continue;
+				}
+				const seenBefore = variants.get(id);
+				if (seenBefore) seenBefore.push({ block: b, file: f });
+				else variants.set(id, [{ block: b, file: f }]);
+			}
+			if (outside) kept.push(`### ${f.basename}\n\n${outside}`);
+		}
+
+		// One highlight can appear in several notes. Keep the fullest copy, and drop
+		// the others only when they add nothing — identical, or wholly contained in
+		// the one kept. Anything else is a copy the reader changed by hand, so it is
+		// set aside rather than silently discarded.
+		const byId = new Map<string, ParsedBlock>();
+		const conflicts: string[] = [];
+		const bare = (t: string) => t.replace(/\s+/g, "");
+		for (const [id, vs] of variants) {
+			const best = vs.reduce((x, y) => (y.block.raw.length > x.block.raw.length ? y : x));
+			byId.set(id, best.block);
+			for (const v of vs) {
+				if (v === best || bare(best.block.raw).includes(bare(v.block.raw))) continue;
+				conflicts.push(`${v.block.raw}\n\n*${tr("来自", "From", "來自", "Da")} [[${v.file.basename}]]*`);
+			}
+		}
+
+		// Blocks whose highlight is no longer in the book (deleted since that export)
+		// have nothing to sort by, so they keep to the end in the order they appeared.
+		const hById = known;
+		const ids = [...byId.keys()].sort((a, b) => {
+			const ha = hById.get(a);
+			const hb = hById.get(b);
+			if (!ha || !hb) return ha ? -1 : hb ? 1 : 0;
+			return compareHighlights(ha, hb, this.sortBy);
+		});
+		const colorOf = (id: string) => known.get(id)?.color ?? "";
+
+		const groups = new Map<string, string[]>();
+		const colorLabels = HIGHLIGHT_COLORS.flatMap((c) => [c.name, c.en, c.tw, c.it]);
+		for (const id of ids) {
+			const block = byId.get(id) as ParsedBlock;
+			const raw = block.raw;
+			// A chapter-grouped source keeps its chapter only in the heading, so fall
+			// back to that — unless the heading is a color, i.e. it was grouped by color.
+			const fromHeading = block.heading && !colorLabels.includes(block.heading) ? block.heading : "";
+			const key =
+				this.groupBy === "chapter"
+					? blockChapter(raw) || fromHeading || tr("未知章节", "Unknown chapter", "未知章節", "Capitolo sconosciuto")
+					: this.groupBy === "color"
+						? colorOf(id)
+							? colorLabel(colorOf(id))
+							: tr("未知颜色", "Unknown color", "未知顏色", "Colore sconosciuto")
+						: "";
+			const bucket = groups.get(key);
+			if (bucket) bucket.push(raw);
+			else groups.set(key, [raw]);
+		}
+
+
+		const lines: string[] = [
+			`# ${tr("高亮摘录（合并）", "Highlights (merged)", "高亮摘錄（合併）", "Evidenziazioni (unite)")}`,
+			"",
+			`> ${tr(
+				`共 ${ids.length} 条高亮 · 合并自 ${files.length} 个文件`,
+				`${ids.length} highlights · merged from ${files.length} notes`,
+				`共 ${ids.length} 條高亮 · 合併自 ${files.length} 個檔案`,
+				`${ids.length} evidenziazioni · da ${files.length} note`
+			)}`,
+			"",
+		];
+		for (const [key, items] of groups) {
+			if (key) lines.push(`## ${key}`, "");
+			for (const raw of items) lines.push(raw, "", "---", "");
+		}
+		// Blocks that matched nothing are kept verbatim, so a later merge of this
+		// file sees them again exactly as they are.
+		if (conflicts.length) {
+			lines.push(
+				`## ${tr("同一条高亮的其他版本", "Other versions of the same highlight", "同一條高亮的其他版本", "Altre versioni della stessa evidenziazione")}`,
+				"",
+				`> ${tr(
+					"这些是你改动过的副本，没有丢，请自行取舍",
+					"Copies you had edited — kept here rather than dropped, so you can choose",
+					"這些是你改動過的副本，沒有丟，請自行取捨",
+					"Copie che avevi modificato: conservate qui, scegli tu"
+				)}`,
+				""
+			);
+			for (const c of conflicts) lines.push(c, "", "---", "");
+		}
+		if (loose.length) {
+			lines.push(
+				`## ${tr("其他内容", "Other content", "其他內容", "Altri contenuti")}`,
+				"",
+				`> ${tr(
+					"这些段落对应不上任何高亮：你自己写的，或原文被改动过的",
+					"These blocks match no highlight: things you wrote, or quotes you edited",
+					"這些段落對應不上任何高亮：你自己寫的，或原文被改動過的",
+					"Blocchi che non corrispondono a nessuna evidenziazione: cose che hai scritto o citazioni modificate"
+				)}`,
+				""
+			);
+			for (const l of loose) lines.push(l, "", "---", "");
+		}
+		if (kept.length) {
+			lines.push(`## ${tr("你写的其他内容", "Your other notes", "你寫的其他內容", "Le tue altre note")}`, "");
+			for (const k of kept) lines.push(k, "");
+		}
+
+		const dupes = seen - loose.length - ids.length - conflicts.length;
+		const stats = tr(
+			`合并 ${files.length} 个文件 · 去重后 ${ids.length} 条 · 去掉重复 ${dupes} 条 · 其他内容 ${kept.length + loose.length} 段 · 改动过的副本 ${conflicts.length} 份`,
+			`${files.length} notes · ${ids.length} highlights after dedupe · ${dupes} duplicates dropped · ${kept.length + loose.length} other sections kept · ${conflicts.length} edited copies set aside`,
+			`合併 ${files.length} 個檔案 · 去重後 ${ids.length} 條 · 去掉重複 ${dupes} 條 · 其他內容 ${kept.length + loose.length} 段 · 改動過的副本 ${conflicts.length} 份`,
+			`${files.length} note · ${ids.length} dopo la deduplica · ${dupes} duplicati rimossi · ${kept.length + loose.length} altre sezioni conservate · ${conflicts.length} copie modificate`
+		);
+		return { md: lines.join("\n"), stats };
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
+// Pick an export folder by browsing the vault's folders instead of typing a path.
+class FolderPickerModal extends Modal {
+	private onPick: (path: string) => void;
+
+	constructor(app: App, onPick: (path: string) => void) {
+		super(app);
+		this.onPick = onPick;
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.createEl("h3", { text: tr("选择导出文件夹", "Choose export folder", "選擇匯出資料夾", "Scegli la cartella di esportazione"), attr: { style: "margin-top: 0;" } });
+		const folders = ["", ...this.app.vault.getAllLoadedFiles().filter((f): f is TFolder => f instanceof TFolder).map((f) => f.path)]
+			.filter((f, i, a) => a.indexOf(f) === i)
+			.sort();
+		const filter = contentEl.createEl("input", {
+			attr: { type: "text", placeholder: tr("筛选…", "Filter…", "篩選…", "Filtra…"), style: "width: 100%; margin-bottom: 8px;" },
+		});
+		const list = contentEl.createDiv({ attr: { style: "max-height: 50vh; overflow: auto;" } });
+		const render = () => {
+			list.empty();
+			const q = filter.value.trim().toLowerCase();
+			for (const f of folders) {
+				if (q && !f.toLowerCase().includes(q)) continue;
+				const row = list.createDiv({ cls: "epub-menu-item" });
+				row.createSpan({ text: f || tr("（库根目录）", "(vault root)", "（庫根目錄）", "(radice della cassaforte)") });
+				row.onclick = () => {
+					this.onPick(f);
+					this.close();
+				};
+			}
+		};
+		filter.oninput = render;
+		render();
+		window.setTimeout(() => filter.focus(), 0);
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
 class ExportSelectModal extends Modal {
 	private view: EpubView;
 	private selected: Set<string>;
@@ -664,7 +1478,10 @@ class ExportSelectModal extends Modal {
 
 	onOpen() {
 		const { contentEl } = this;
-		contentEl.createEl("h3", { text: tr("选择要导出的高亮", "Choose highlights to export", "選擇要匯出的高亮", "Scegli le evidenziazioni da esportare"), attr: { style: "margin-top: 0;" } });
+		// Column layout with only the list scrolling, so the export button and the
+		// path row stay in view however many highlights the book has.
+		contentEl.setCssStyles({ display: "flex", flexDirection: "column", maxHeight: "72vh" });
+		contentEl.createEl("h3", { text: tr("选择要导出的高亮", "Choose highlights to export", "選擇要匯出的高亮", "Scegli le evidenziazioni da esportare"), attr: { style: "margin-top: 0; flex-shrink: 0;" } });
 
 		const record = this.view.plugin.getBookRecord(this.view.filePath);
 		const sorted = [...record.highlights].sort((a, b) => a.created - b.created);
@@ -674,23 +1491,118 @@ class ExportSelectModal extends Modal {
 		}
 
 		let exportBtn: HTMLButtonElement;
-		const updateExportBtn = () => {
+		let copyBtn: HTMLButtonElement;
+		const updateBtns = () => {
 			exportBtn.textContent = tr(`导出所选 (${this.selected.size})`, `Export selected (${this.selected.size})`, `匯出所選 (${this.selected.size})`, `Esporta (${this.selected.size})`);
-			exportBtn.disabled = this.selected.size === 0;
+			copyBtn.textContent = tr(`复制所选 (${this.selected.size})`, `Copy selected (${this.selected.size})`, `複製所選 (${this.selected.size})`, `Copia (${this.selected.size})`);
+			exportBtn.disabled = copyBtn.disabled = this.selected.size === 0;
 		};
 
-		const allRow = contentEl.createDiv({ attr: { style: "display:flex; align-items:center; gap:8px; padding:6px 0; border-bottom:1px solid var(--background-modifier-border);" } });
-		const allCb = allRow.createEl("input", { attr: { type: "checkbox" } });
+		// Spine index / chapter name of each highlight, for the per-chapter filter.
+		const chapters = chapterLookup(this.view.book);
+		const spinePos = chapters.posOf;
+		const chapterLabel = chapters.labelAt;
+		const positions = [...new Set(sorted.map((h) => spinePos(h.cfiRange)).filter((p) => p >= 0))].sort((a, b) => a - b);
+
+		const rowCbs: { cb: HTMLInputElement; h: Highlight }[] = [];
+		let allCb: HTMLInputElement;
+		// Replace the selection with `ids` and sync every checkbox to it.
+		const applySelection = (ids: Set<string>) => {
+			this.selected = ids;
+			rowCbs.forEach(({ cb, h }) => (cb.checked = ids.has(h.id)));
+			allCb.checked = ids.size === sorted.length;
+			updateBtns();
+		};
+
+		// Quick filters: all / today / one chapter / by color. Each one replaces the
+		// selection, so the list always shows exactly what will be exported.
+		const activeColors = new Set<string>();
+		let clearChips: () => void = () => undefined;
+		const filterRow = contentEl.createDiv({ attr: { style: "display:flex; align-items:center; gap:8px; padding:6px 0; flex-wrap:wrap; flex-shrink:0;" } });
+		const allBtn = filterRow.createEl("button", { text: tr("全部", "All", "全部", "Tutte") });
+		allBtn.onclick = () => {
+			chapterSel.value = "";
+			clearChips();
+			applySelection(new Set(sorted.map((h) => h.id)));
+		};
+		const todayBtn = filterRow.createEl("button", { text: tr("今日", "Today", "今日", "Oggi") });
+		todayBtn.onclick = () => {
+			chapterSel.value = "";
+			clearChips();
+			const now = new Date();
+			applySelection(new Set(sorted.filter((h) => {
+				const d = new Date(h.created);
+				return d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+			}).map((h) => h.id)));
+		};
+		// Obsidian's native "dropdown" class gives the select the same control
+		// chrome (border, radius, height) as the two buttons beside it.
+		const chapterSel = filterRow.createEl("select", { cls: "dropdown" });
+		// Chapter titles can be long, and a select is as wide as its widest option,
+		// which would push everything else onto another line.
+		chapterSel.setCssStyles({ maxWidth: "150px", flexShrink: "0" });
+		chapterSel.createEl("option", { text: tr("章节选择…", "Select chapter…", "章節選擇…", "Seleziona capitolo…"), value: "" });
+		for (const p of positions) chapterSel.createEl("option", { text: chapterLabel(p), value: `${p}` });
+		// The dropdown carries its own radius, which the theme may set apart from the
+		// buttons'. Copy the buttons' computed radius so all three share one shape.
+		window.requestAnimationFrame(() => {
+			const radius = getComputedStyle(allBtn).borderRadius;
+			for (const sel of [chapterSel, sortSel]) sel.setCssStyles({ borderRadius: radius });
+		});
+		chapterSel.onchange = () => {
+			if (chapterSel.value === "") return;
+			clearChips();
+			const p = Number(chapterSel.value);
+			applySelection(new Set(sorted.filter((h) => spinePos(h.cfiRange) === p).map((h) => h.id)));
+		};
+
+		// One chip per color this book actually uses, presets first. Ticking chips
+		// selects those highlights (several chips = all of them together); the set is
+		// remembered so the same colors come back ticked next time.
+		const presetRank = (v: string) => {
+			const i = HIGHLIGHT_COLORS.findIndex((c) => c.value === v);
+			return i < 0 ? HIGHLIGHT_COLORS.length : i;
+		};
+		const usedColors = [...new Set(sorted.map((h) => h.color))].sort((x, y) => presetRank(x) - presetRank(y));
+		const chips = new Map<string, HTMLElement>();
+		const applyColors = () => {
+			chapterSel.value = "";
+			for (const [value, chip] of chips) chip.toggleClass("is-active", activeColors.has(value));
+			applySelection(
+				new Set(
+					(activeColors.size ? sorted.filter((h) => activeColors.has(h.color)) : sorted).map((h) => h.id)
+				)
+			);
+		};
+		clearChips = () => {
+			activeColors.clear();
+			for (const chip of chips.values()) chip.removeClass("is-active");
+		};
+		if (usedColors.length > 1) {
+			const chipRow = filterRow.createDiv({ attr: { style: "display:flex; gap:6px; margin-left:4px;" } });
+			for (const value of usedColors) {
+				const chip = chipRow.createEl("button", { cls: "epub-swatch-dot", attr: { title: colorLabel(value) } });
+				chip.setCssStyles({ background: value, width: "18px", height: "18px" });
+				chips.set(value, chip);
+				chip.onclick = () => {
+					if (activeColors.has(value)) activeColors.delete(value);
+					else activeColors.add(value);
+					applyColors();
+				};
+			}
+		}
+
+		const allRow = contentEl.createDiv({ attr: { style: "display:flex; align-items:center; gap:8px; padding:6px 0; border-bottom:1px solid var(--background-modifier-border); flex-shrink:0;" } });
+		allCb = allRow.createEl("input", { attr: { type: "checkbox" } });
 		allCb.checked = true;
 		allRow.createSpan({ text: tr("全选", "Select all", "全選", "Seleziona tutto"), attr: { style: "font-weight:600;" } });
 
-		const list = contentEl.createDiv({ attr: { style: "max-height:50vh; overflow:auto;" } });
-		const rowCbs: HTMLInputElement[] = [];
+		const list = contentEl.createDiv({ attr: { style: "flex:1; min-height:0; overflow:auto;" } });
 		for (const h of sorted) {
-			const row = list.createDiv({ attr: { style: "display:flex; gap:8px; padding:8px 0; border-bottom:1px solid var(--background-modifier-border);" } });
+			const row = list.createDiv({ attr: { style: "display:flex; gap:8px; padding:8px 0; border-bottom:1px solid var(--background-modifier-border); cursor:pointer;" } });
 			const cb = row.createEl("input", { attr: { type: "checkbox", style: "margin-top:3px; flex-shrink:0;" } });
 			cb.checked = true;
-			rowCbs.push(cb);
+			rowCbs.push({ cb, h });
 			row.createDiv({ attr: { style: `width:12px;height:12px;border-radius:3px;background:${h.color};margin-top:3px;flex-shrink:0;` } });
 			const body = row.createDiv({ attr: { style: "flex:1; min-width:0;" } });
 			const page = this.view.getPageLabel(h.cfiRange);
@@ -700,27 +1612,97 @@ class ExportSelectModal extends Modal {
 				if (cb.checked) this.selected.add(h.id);
 				else this.selected.delete(h.id);
 				allCb.checked = this.selected.size === sorted.length;
-				updateExportBtn();
+				updateBtns();
+			};
+			// The whole row toggles the checkbox (a bigger click target).
+			row.onclick = (e) => {
+				if (e.target !== cb) cb.click();
 			};
 		}
 
 		allCb.onchange = () => {
-			this.selected = new Set(allCb.checked ? sorted.map((h) => h.id) : []);
-			rowCbs.forEach((cb) => (cb.checked = allCb.checked));
-			updateExportBtn();
+			applySelection(allCb.checked ? new Set(sorted.map((h) => h.id)) : new Set());
 		};
 
-		const footer = contentEl.createDiv({ attr: { style: "margin-top:12px; text-align:right;" } });
+		// Export target: prefilled from settings, editable for this export only —
+		// unless "set as default" is ticked, which writes the path back to settings.
+		const ep = this.view.plugin.exportPrefs;
+		let folder = ep.folder;
+		const pathRow = contentEl.createDiv({ attr: { style: "display:flex; align-items:center; gap:8px; margin-top:12px; flex-shrink:0; flex-wrap:wrap;" } });
+		pathRow.createSpan({ text: tr("排序：", "Sort:", "排序：", "Ordina:"), attr: { style: "color:var(--text-muted); white-space:nowrap;" } });
+		const sortSel = pathRow.createEl("select", { cls: "dropdown" });
+		sortSel.createEl("option", { text: tr("按书中顺序", "Book order", "按書中順序", "Ordine del libro"), value: "book" });
+		sortSel.createEl("option", { text: tr("按划线时间", "Highlight time", "按劃線時間", "Ora dell'evidenziazione"), value: "created" });
+		sortSel.value = this.view.plugin.exportPrefs.sortBy;
+		pathRow.createSpan({ text: tr("导出到：", "Export to:", "匯出到：", "Esporta in:"), attr: { style: "color:var(--text-muted); white-space:nowrap;" } });
+		const pathInput = pathRow.createEl("input", {
+			attr: { type: "text", style: "flex:1; min-width:0;", placeholder: tr("库根目录", "Vault root", "庫根目錄", "Radice della cassaforte") },
+		});
+		pathInput.value = folder;
+		pathInput.oninput = () => (folder = pathInput.value.trim());
+		const browseBtn = pathRow.createEl("button", { attr: { style: "display:flex; align-items:center;", title: tr("浏览文件夹", "Browse folders", "瀏覽資料夾", "Sfoglia le cartelle") } });
+		setIcon(browseBtn, "folder");
+		browseBtn.onclick = () =>
+			new FolderPickerModal(this.app, (f) => {
+				folder = f;
+				pathInput.value = f;
+			}).open();
+		const defLabel = pathRow.createEl("label", { attr: { style: "display:flex; align-items:center; gap:4px; white-space:nowrap; color:var(--text-muted);" } });
+		const defCb = defLabel.createEl("input", { attr: { type: "checkbox" } });
+		defLabel.createSpan({ text: tr("设为默认", "Set as default", "設為預設", "Imposta come predefinito") });
+
+		const footer = contentEl.createDiv({ attr: { style: "margin-top:12px; display:flex; justify-content:flex-end; gap:8px; flex-shrink:0;" } });
+		copyBtn = footer.createEl("button");
+		copyBtn.onclick = async () => {
+			const items = sorted.filter((h) => this.selected.has(h.id));
+			if (items.length === 0) return;
+			await this.view.waitForPagination();
+			this.view.copyQuotes(items);
+		};
 		exportBtn = footer.createEl("button", { cls: "mod-cta" });
-		updateExportBtn();
+		updateBtns();
 		exportBtn.onclick = async () => {
 			if (this.selected.size === 0) return;
 			exportBtn.disabled = true;
 			new Notice(tr("正在导出为 Markdown…", "Exporting to Markdown…", "正在匯出為 Markdown…", "Esportazione in Markdown…"));
 			await this.view.waitForPagination();
-			await this.view.plugin.exportHighlights(this.view.filePath, (cfi) => this.view.getPageLabel(cfi), this.selected);
+			// Remember the chips (and the folder, if asked) in one write — the plugin
+			// data file is large enough that saving on every click would be wasteful.
+			const chosen = [...activeColors];
+			const was = record.colorFilter ?? [];
+			const chipsChanged = chosen.length !== was.length || chosen.some((c) => !was.includes(c));
+			const folderChanged = defCb.checked && folder !== ep.folder;
+			if (chipsChanged || folderChanged) {
+				record.colorFilter = chosen;
+				if (folderChanged) ep.folder = folder;
+				await this.view.plugin.saveBookData();
+			}
+			// The dialog's sort choice covers this export only; the stored default is
+			// put back as soon as the file is written.
+			const savedSort = ep.sortBy;
+			ep.sortBy = sortSel.value as ExportPrefs["sortBy"];
+			try {
+				await this.view.plugin.exportHighlights(
+					this.view.filePath,
+					(cfi) => this.view.getPageLabel(cfi),
+					this.selected,
+					chapters.labelOf,
+					folder
+				);
+			} finally {
+				ep.sortBy = savedSort;
+			}
 			this.close();
 		};
+
+		// Last of all: restoring the chips changes the selection, which refreshes the
+		// footer buttons — so they have to exist by now. Colors this book no longer
+		// has are ignored.
+		const remembered = (record.colorFilter ?? []).filter((c) => chips.has(c));
+		if (remembered.length) {
+			for (const c of remembered) activeColors.add(c);
+			applyColors();
+		}
 	}
 
 	onClose() {
@@ -948,6 +1930,9 @@ class EpubView extends FileView {
 	lastColor = HIGHLIGHT_COLORS[0].value;
 	// Last hex chosen from the custom color picker (for its swatch + picker default).
 	customHlColor = "#ffd54f";
+	// Cross-page highlight anchor: start point marked in a chapter's document,
+	// finished by a later selection in the same document. Cleared on re-render.
+	pendingStart: { doc: Document; node: Node; offset: number } | null = null;
 	// Undo stack of reversible highlight actions (newest last).
 	undoStack: { type: "create" | "delete"; highlight: Highlight }[] = [];
 
@@ -1079,7 +2064,7 @@ class EpubView extends FileView {
 					this.closeMenus();
 					new Notice(tr("正在导出为 Markdown…", "Exporting to Markdown…", "正在匯出為 Markdown…", "Esportazione in Markdown…"));
 					await this.waitForPagination();
-					await this.plugin.exportHighlights(this.filePath, (cfi) => this.getPageLabel(cfi));
+					await this.plugin.exportHighlights(this.filePath, (cfi) => this.getPageLabel(cfi), undefined, chapterLookup(this.book).labelOf);
 				};
 
 				// Default highlight color for ⌘⇧H / drag-select. Selected one shows a
@@ -1125,10 +2110,45 @@ class EpubView extends FileView {
 							presetSws.forEach((s) => s.removeClass("is-active"));
 							rainbow.addClass("is-active");
 						},
-						() => this.savePrefs()
+						() => {
+							if (this.customColorActive()) this.recordCustomColor(this.customHlColor);
+							this.savePrefs();
+						}
 					);
 					window.requestAnimationFrame(() => hlPicker?.addClass("is-open"));
 				};
+
+				// Recently used custom colors — small dots, shown only once one exists.
+				// Only colors that still have highlights: a color picked once and since
+				// deleted is just noise in a palette meant for reuse.
+				const inUse = new Set<string>();
+				for (const book of Object.values(this.plugin.data.books)) {
+					for (const h of book.highlights) inUse.add(h.color);
+				}
+				const hist = (this.plugin.data.prefs.customHlHistory ?? [])
+					.filter((hex) => inUse.has(hexToHighlightRgba(hex)))
+					.slice(0, 5);
+				if (hist.length) {
+					menu.createDiv({ cls: "epub-menu-label", text: tr("最近使用的颜色", "Recently used colors", "最近使用的顏色", "Colori usati di recente") });
+					// Same class and row styling as the preset palette above, so the two
+					// groups read as one stack (identical dot size and spacing).
+					const histRow = menu.createDiv({ cls: "epub-menu-item" });
+					histRow.setCssStyles({ gap: "10px", flexWrap: "wrap", cursor: "default" });
+					for (const hex of hist) {
+						const d = histRow.createEl("button", { cls: "epub-swatch-dot", attr: { title: hex } });
+						d.setCssStyles({ background: hexToHighlightRgba(hex) });
+						d.onclick = (ev) => {
+							ev.stopPropagation();
+							this.customHlColor = hex;
+							this.lastColor = hexToHighlightRgba(hex);
+							rainbow.setCssStyles({ background: this.lastColor });
+							presetSws.forEach((s) => s.removeClass("is-active"));
+							rainbow.addClass("is-active");
+							this.recordCustomColor(hex);
+							this.savePrefs();
+						};
+					}
+				}
 			});
 		};
 
@@ -1487,7 +2507,16 @@ class EpubView extends FileView {
 			fontFamily: this.fontFamily,
 			fontSize: this.fontSize,
 			highlightColor: this.lastColor,
+			customHlHistory: this.plugin.data.prefs.customHlHistory ?? [],
 		};
+		void this.plugin.saveBookData();
+	}
+
+	// Remember a picked custom color in the recent-colors history (dedup, max 5).
+	recordCustomColor(hex: string) {
+		const list = (this.plugin.data.prefs.customHlHistory ?? []).filter((c) => c.toLowerCase() !== hex.toLowerCase());
+		list.unshift(hex);
+		this.plugin.data.prefs.customHlHistory = list.slice(0, 5);
 		void this.plugin.saveBookData();
 	}
 
@@ -1735,6 +2764,8 @@ class EpubView extends FileView {
 		// the last saved reading position.
 		const cfi = this.rendition?.location?.start?.cfi ?? this.plugin.getBookRecord(this.filePath).lastCfi;
 		this.rendition?.destroy();
+		// The old chapter documents are gone; a marked cross-page start is stale.
+		this.pendingStart = null;
 
 		this.rendition = this.book.renderTo(this.container, {
 			width: "100%",
@@ -1829,7 +2860,11 @@ class EpubView extends FileView {
 		// Fixed whole-book page number + total from the offscreen pre-pagination,
 		// unchanged while reading (a page turn only advances the number by 1).
 		if (this.hasVisualPages()) {
-			const current = Math.max(1, this.currentVisualPage());
+			// Locate the current screen inside the scanned page grid by CFI. This
+			// stays accurate even if the live layout drifts slightly from the scan
+			// (offset+page would then over/under-shoot and make numbers jump).
+			const byCfi = loc.cfi ? this.visualPageFromCfi(loc.cfi) : 0;
+			const current = Math.max(1, byCfi > 0 ? byCfi : this.currentVisualPage());
 			const total = this.visualTotal;
 			const pct = total ? Math.min(100, Math.max(0, Math.round((current / total) * 100))) : 0;
 			setBox(`${current}`, `/ ${total}  ·  ${pct}%`, true);
@@ -2013,7 +3048,7 @@ class EpubView extends FileView {
 		const containerRect = this.contentEl.getBoundingClientRect();
 
 		const toolbar = this.contentEl.createDiv({
-			attr: { style: "position: absolute; z-index: 1000; background: var(--background-secondary); border-radius: 6px; padding: 4px; display: flex; gap: 4px; box-shadow: var(--shadow-s);" },
+			attr: { style: "position: absolute; z-index: 1000; background: var(--background-secondary); border-radius: 6px; padding: 4px; display: flex; align-items: center; gap: 4px; box-shadow: var(--shadow-s);" },
 		});
 		// Clicks on the popup must not reach the outside-click dismiss handler.
 		toolbar.addEventListener("click", (e) => e.stopPropagation());
@@ -2051,6 +3086,8 @@ class EpubView extends FileView {
 			input.addEventListener("change", () => {
 				this.customHlColor = input.value;
 				this.lastColor = hexToHighlightRgba(input.value);
+				this.recordCustomColor(input.value);
+				this.savePrefs();
 				this.createHighlight(cfiRange, text, this.lastColor, range, contents.document);
 				selection.removeAllRanges();
 				this.dismissColorToolbar();
@@ -2058,6 +3095,54 @@ class EpubView extends FileView {
 			});
 			input.click();
 		};
+
+		// Cross-page highlight within one chapter: mark a start point, turn pages,
+		// then finish from a later selection. A DOM Range can span the pages of one
+		// chapter (they're columns of the same document) but never two chapters.
+		const sep = toolbar.createDiv();
+		sep.setCssStyles({ width: "0.8px", height: `${TOOLBAR_ICON_PX}px`, background: "var(--background-modifier-border)", margin: "0 2px" });
+		const startBtn = toolbar.createEl("button", {
+			attr: { style: `${TOOLBAR_ICON_BTN_STYLE} color: var(--text-normal);`, title: tr("标记跨页起点", "Mark cross-page start", "標記跨頁起點", "Segna inizio multi-pagina") },
+		});
+		drawPencilIcon(startBtn, PENCIL_MARK_START);
+		startBtn.onclick = () => {
+			this.pendingStart = { doc: contents.document, node: range.startContainer, offset: range.startOffset };
+			selection.removeAllRanges();
+			this.dismissColorToolbar();
+			new Notice(tr("已标记起点：翻页后选中终点，再点铅笔 ✓", "Start marked: turn pages, select the end, then click the pencil with the check", "已標記起點：翻頁後選取終點，再點鉛筆 ✓", "Inizio segnato: gira pagina, seleziona la fine, poi la matita con la spunta"));
+		};
+		if (this.pendingStart && this.pendingStart.doc === contents.document) {
+			const endBtn = toolbar.createEl("button", {
+				attr: { style: `${TOOLBAR_ICON_BTN_STYLE} color: var(--interactive-accent);`, title: tr("从起点高亮到此处", "Highlight from start to here", "從起點高亮到此處", "Evidenzia dall'inizio a qui") },
+			});
+			drawPencilIcon(endBtn, PENCIL_MARK_END);
+			endBtn.onclick = () => {
+				const start = this.pendingStart!;
+				try {
+					const r = contents.document.createRange();
+					r.setStart(start.node, start.offset);
+					r.setEnd(range.endContainer, range.endOffset);
+					// Selection made before the marked start: build the range the other way.
+					if (r.collapsed) {
+						r.setStart(range.startContainer, range.startOffset);
+						r.setEnd(start.node, start.offset);
+					}
+					const fullText = r.toString();
+					if (!fullText.trim()) throw new Error("empty");
+					this.createHighlight(contents.cfiFromRange(r), fullText, this.lastColor, r, contents.document);
+					this.pendingStart = null;
+					selection.removeAllRanges();
+					this.dismissColorToolbar();
+				} catch {
+					new Notice(tr("跨页高亮失败：请重新标记起点", "Cross-page highlight failed: mark the start again", "跨頁高亮失敗：請重新標記起點", "Evidenziazione multi-pagina non riuscita: risegna l'inizio"));
+					this.pendingStart = null;
+				}
+			};
+		}
+
+		// All buttons are in place — clamp the popup inside the view's right edge
+		// (selections near the margin would otherwise push part of it off-screen).
+		toolbar.setCssStyles({ left: `${Math.max(4, Math.min(left, containerRect.width - toolbar.offsetWidth - 4))}px` });
 	}
 
 	// Whether the active highlight color is a custom (non-preset) one.
@@ -2116,11 +3201,16 @@ class EpubView extends FileView {
 			new Notice(tr("这本书还没有任何高亮记录", "This book has no highlights yet", "這本書還沒有任何高亮記錄", "Questo libro non ha ancora evidenziazioni"));
 			return;
 		}
-		const text = sorted
+		this.copyQuotes(sorted);
+	}
+
+	// Copy the given highlights to the clipboard as stacked quote blocks.
+	copyQuotes(items: Highlight[]) {
+		const text = items
 			.map((h) => formatQuote(this.getPageLabel(h.cfiRange), h.created, h.text, h.note))
 			.join("\n\n");
 		void navigator.clipboard.writeText(text).then(
-			() => new Notice(tr(`已复制 ${sorted.length} 条高亮`, `Copied ${sorted.length} highlights`, `已複製 ${sorted.length} 條高亮`, `Copiate ${sorted.length} evidenziazioni`)),
+			() => new Notice(tr(`已复制 ${items.length} 条高亮`, `Copied ${items.length} highlights`, `已複製 ${items.length} 條高亮`, `Copiate ${items.length} evidenziazioni`)),
 			() => new Notice(tr("复制失败", "Copy failed", "複製失敗", "Copia non riuscita"))
 		);
 	}
