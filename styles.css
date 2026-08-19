@@ -52,7 +52,7 @@
 
 /* Flat, colored icon button — no border/box (force past themes that add one).
    The accent color signals it's clickable; hover adds a soft fill. */
-.epub-tb-btn {
+button.epub-tb-btn {
 	height: 30px;
 	min-width: 30px;
 	padding: 0 8px;
@@ -60,9 +60,9 @@
 	align-items: center;
 	justify-content: center;
 	gap: 4px;
-	border: none !important;
-	background-color: transparent !important;
-	box-shadow: none !important;
+	border: none;
+	background-color: transparent;
+	box-shadow: none;
 	color: var(--interactive-accent);
 	border-radius: 8px;
 	cursor: pointer;
@@ -70,20 +70,20 @@
 	line-height: 1;
 	flex-shrink: 0;
 }
-.epub-tb-btn:hover {
-	background-color: var(--background-modifier-hover) !important;
+button.epub-tb-btn:hover {
+	background-color: var(--background-modifier-hover);
 }
-.epub-tb-btn:focus,
-.epub-tb-btn:focus-visible {
-	box-shadow: none !important;
-	outline: none !important;
+button.epub-tb-btn:focus,
+button.epub-tb-btn:focus-visible {
+	box-shadow: none;
+	outline: none;
 }
 /* Selected (its dropdown is open): an underline, still no box. */
-.epub-tb-btn.is-open {
-	box-shadow: inset 0 -2px 0 var(--interactive-accent) !important;
+button.epub-tb-btn.is-open {
+	box-shadow: inset 0 -2px 0 var(--interactive-accent);
 	border-radius: 8px 8px 0 0;
 }
-.epub-tb-btn:disabled {
+button.epub-tb-btn:disabled {
 	opacity: 0.4;
 	cursor: default;
 }
@@ -390,4 +390,24 @@
 	font-size: 12px;
 	color: var(--text-muted);
 	font-variant-numeric: tabular-nums;
+}
+
+/* Icons in the selection popup: same box as the color swatches beside them, and
+   a stroke Obsidian's .svg-icon rules would otherwise thin out. */
+.epub-tb-icon {
+	width: 18px;
+	height: 18px;
+	flex-shrink: 0;
+	stroke-width: 2;
+	transform: translateY(5%);
+}
+
+/* Template help: one labelled block per idea, so it stays readable when the
+   settings column is narrow. */
+.epub-tpl-help {
+	margin-bottom: 8px;
+}
+.epub-tpl-help-label {
+	font-weight: 600;
+	color: var(--text-normal);
 }

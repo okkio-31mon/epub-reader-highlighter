@@ -21,6 +21,7 @@ Leggi i libri EPUB direttamente dentro Obsidian, annotali con evidenziazioni col
 - **Colori usati di recente** — i colori personalizzati restano a portata di clic e spariscono dall'elenco quando nessuna evidenziazione li usa più.
 - **Esportazione Markdown** — esporta tutte le evidenziazioni o solo quelle che scegli, decidendo cartella, raggruppamento, ordinamento e quali dettagli accompagnano ogni evidenziazione. Ogni esportazione crea un nuovo file con data e ora: nulla viene mai sovrascritto.
 - **Unione delle note esportate** — fonde più esportazioni dello stesso libro in una sola: i duplicati vengono rimossi e ciò che hai scritto resta intatto. Gli originali non vengono modificati.
+- **Modello di esportazione personalizzato** — decidi come viene scritta ogni evidenziazione con `{{text}}`, `{{note}}`, `{{page}}`, `{{chapter}}` e altre variabili, con un blocco condizionale che compare solo se esiste una nota.
 - **Guida al primo avvio** — un popup una tantum spiega le icone della barra degli strumenti; lo stesso riferimento resta nella scheda impostazioni del plugin.
 
 ## Installazione
@@ -66,6 +67,8 @@ Dal menu evidenziazioni scegli **Esporta selezionate…**. La riga in alto della
 **Esporta in Markdown**, nello stesso menu, salta la finestra ed esporta tutto.
 
 Le impostazioni dell'estensione contengono i valori predefiniti: cartella di esportazione, raggruppamento (nessuno / per capitolo / per colore), ordinamento (ordine del libro oppure ordine di evidenziazione) e gli interruttori per capitolo, numero di pagina, data, nota, nome del colore e numerazione.
+
+Attivando **Usa un modello personalizzato** quegli interruttori lasciano il posto a un riquadro in cui decidi la forma di ogni voce: `{{index}}`, `{{text}}`, `{{note}}`, `{{page}}`, `{{chapter}}`, `{{book}}`, `{{date}}`, `{{time}}`, `{{color}}`. Ciò che sta tra `{{#note}}` e `{{/note}}` viene scritto solo se la nota esiste, così le voci senza nota non lasciano etichette vuote. I titoli dei gruppi e il separatore restano all'estensione: l'unione si basa su di essi.
 
 Poiché ogni esportazione è un file a sé con data e ora, un libro letto in più sessioni lascia più note. **Unisci le note di evidenziazioni esportate** (tavolozza dei comandi o pulsante nelle impostazioni) ne fonde quante ne vuoi in una sola: scegli le note, il raggruppamento e l'ordinamento, guarda l'anteprima e il risultato viene scritto in un nuovo file. Le evidenziazioni ripetute restano una volta sola; ciò che non corrisponde a nessuna evidenziazione — quello che hai scritto tu o una citazione che hai modificato — resta sotto «Altri contenuti». Le note di partenza non vengono mai toccate.
 

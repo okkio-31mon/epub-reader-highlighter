@@ -1,0 +1,54 @@
+name: Release
+
+# Pushing a version tag builds the plugin here, signs the result, and publishes
+# it. Building on GitHub is what makes the attestation meaningful: it proves the
+# released files came from this repository at this commit.
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Fail early if the tag and manifest disagree
+        run: |
+          manifest=$(node -p "require('./manifest.json').version")
+          if [ "$GITHUB_REF_NAME" != "$manifest" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match manifest.json version $manifest"
+            exit 1
+          fi
+
+      - run: npm ci
+      - run: npm run build
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            main.js
+            manifest.json
+            styles.css
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" main.js manifest.json styles.css --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" main.js manifest.json styles.css \
+              --title "$GITHUB_REF_NAME" --generate-notes
+          fi

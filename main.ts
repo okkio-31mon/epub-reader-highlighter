@@ -12,6 +12,9 @@ import {
 	WorkspaceLeaf,
 	Modal,
 	MarkdownRenderer,
+	TextAreaComponent,
+	Component,
+	getLanguage,
 } from "obsidian";
 import ePub, { Book, Rendition, Contents, EpubCFI } from "epubjs";
 
@@ -58,7 +61,10 @@ let loadedSystemFonts: string[] = [];
 function resolveLang(setting: string): Lang {
 	if (setting === "zh" || setting === "en" || setting === "zh-TW" || setting === "it") return setting;
 	// "auto": follow Obsidian's own UI language.
-	const l = (window.localStorage.getItem("language") ?? "").toLowerCase();
+	// getLanguage() is the supported way, but it only exists on newer Obsidian
+	// builds — older ones still have to be read out of local storage.
+	const raw = typeof getLanguage === "function" ? getLanguage() : window.localStorage.getItem("language");
+	const l = (raw ?? "").toLowerCase();
 	if (l.startsWith("zh-tw") || l.startsWith("zh-hant") || l === "zh-hk") return "zh-TW";
 	if (l.startsWith("zh")) return "zh";
 	if (l.startsWith("it")) return "it";
@@ -133,6 +139,10 @@ interface ExportPrefs {
 	showColor: boolean;
 	// A running number before each quote, so a long export stays easy to refer to.
 	showIndex: boolean;
+	// When on, `template` decides how one highlight is written and the toggles
+	// above no longer apply.
+	useTemplate: boolean;
+	template: string;
 }
 
 const DEFAULT_EXPORT: ExportPrefs = {
@@ -145,6 +155,8 @@ const DEFAULT_EXPORT: ExportPrefs = {
 	showNote: true,
 	showColor: false,
 	showIndex: true,
+	useTemplate: false,
+	template: "",
 };
 
 // Exports carry no markers at all: every comment syntax Obsidian has stays
@@ -192,10 +204,68 @@ function compareHighlights(a: Highlight, b: Highlight, by: ExportPrefs["sortBy"]
 	return a.created - b.created;
 }
 
-// Display name of a highlight color; custom picks have no preset name.
+// Fill {{name}} placeholders, and keep a {{#name}}…{{/name}} block only when that
+// value isn't empty — without it, a highlight with no note would export a bare
+// "Note:" label.
+function renderTemplate(tpl: string, vars: Record<string, string>): string {
+	// The newline after a closing tag goes with the block when it is dropped, and
+	// stays when it is kept — otherwise a kept block glues itself to the next line.
+	let out = tpl.replace(/\{\{#(\w+)\}\}([\s\S]*?)\{\{\/\1\}\}(\n?)/g, (_m, key: string, body: string, nl: string) =>
+		vars[key]?.trim() ? body + nl : ""
+	);
+	out = out.replace(/\{\{(\w+)\}\}/g, (_m, key: string) => vars[key] ?? "");
+	// An empty value in the middle of a "a · b · c" line leaves stray separators.
+	out = out
+		.replace(/(?: · ){2,}/g, " · ")
+		.replace(/\*\s*·\s*/g, "*")
+		.replace(/\s*·\s*\*/g, "*")
+		.replace(/\n{3,}/g, "\n\n");
+	return out.trim();
+}
+
+// The template that reproduces what the field toggles currently produce, used to
+// prefill the box so custom templates start from something familiar.
+function defaultTemplate(ep: ExportPrefs): string {
+	const lines: string[] = [`> ${ep.showIndex ? "**{{index}}.** " : ""}{{text}}`];
+	if (ep.showNote) lines.push("", `{{#note}}**${tr("备注", "Note", "備註", "Nota")}：** {{note}}{{/note}}`);
+	const meta: string[] = [];
+	if (ep.showChapter) meta.push("{{chapter}}");
+	if (ep.showPage) meta.push(tr("第 {{page}} 页", "Page {{page}}", "第 {{page}} 頁", "Pagina {{page}}"));
+	if (ep.showDate) meta.push("{{date}}");
+	if (ep.showColor) meta.push("{{color}}");
+	if (meta.length) lines.push("", `*${meta.join(" · ")}*`);
+	return lines.join("\n");
+}
+
+// Hue names for colors picked with the wheel: "浅粉" says more than "custom",
+// and costs the reader nothing to set up.
+const HUE_NAMES: { max: number; zh: string; en: string; tw: string; it: string }[] = [
+	{ max: 15, zh: "红", en: "red", tw: "紅", it: "rosso" },
+	{ max: 45, zh: "橙", en: "orange", tw: "橙", it: "arancione" },
+	{ max: 70, zh: "黄", en: "yellow", tw: "黃", it: "giallo" },
+	{ max: 150, zh: "绿", en: "green", tw: "綠", it: "verde" },
+	{ max: 195, zh: "青", en: "cyan", tw: "青", it: "ciano" },
+	{ max: 250, zh: "蓝", en: "blue", tw: "藍", it: "blu" },
+	{ max: 290, zh: "紫", en: "purple", tw: "紫", it: "viola" },
+	{ max: 325, zh: "品红", en: "magenta", tw: "洋紅", it: "magenta" },
+	{ max: 350, zh: "粉", en: "pink", tw: "粉", it: "rosa" },
+	{ max: 361, zh: "红", en: "red", tw: "紅", it: "rosso" },
+];
+
+function autoColorName(value: string): string {
+	const { h, s, v } = hexToHsv(rgbaToHex(value));
+	if (s < 0.12) return v > 0.8 ? tr("浅灰", "Light grey", "淺灰", "Grigio chiaro") : tr("灰", "Grey", "灰", "Grigio");
+	const hue = HUE_NAMES.find((x) => h < x.max) ?? HUE_NAMES[0];
+	const name = tr(hue.zh, hue.en, hue.tw, hue.it);
+	if (s < 0.4) return tr(`浅${name}`, `Light ${name}`, `淺${name}`, `${name} chiaro`);
+	if (v < 0.45) return tr(`深${name}`, `Dark ${name}`, `深${name}`, `${name} scuro`);
+	return name;
+}
+
+// Display name of a highlight color: the preset's name, or one read off the hue.
 function colorLabel(value: string): string {
 	const c = HIGHLIGHT_COLORS.find((x) => x.value === value);
-	return c ? tr(c.name, c.en, c.tw, c.it) : tr("自定义", "Custom", "自訂", "Personalizzato");
+	return c ? tr(c.name, c.en, c.tw, c.it) : autoColorName(value);
 }
 
 // Background themes, last one is the dark theme (gets light text + light link color).
@@ -374,14 +444,10 @@ function sizeToolbarIcon(btn: HTMLElement) {
 	if (!svg) return;
 	svg.setAttribute("width", `${TOOLBAR_ICON_PX}`);
 	svg.setAttribute("height", `${TOOLBAR_ICON_PX}`);
-	// Obsidian's .svg-icon rules otherwise shrink the icon and thin its strokes.
-	svg.style.setProperty("width", `${TOOLBAR_ICON_PX}px`);
-	svg.style.setProperty("height", `${TOOLBAR_ICON_PX}px`);
-	svg.style.setProperty("flex-shrink", "0");
-	svg.style.setProperty("stroke-width", "2");
-	// The pencil's mass sits high in its box, which reads as misaligned next to the
-	// round swatches; a nudge of a twentieth of its height settles it.
-	svg.style.setProperty("transform", "translateY(5%)");
+	// The class carries the size, the stroke weight Obsidian's .svg-icon would
+	// otherwise thin, and the nudge that lines the pencil up with the round
+	// swatches beside it.
+	svg.addClass("epub-tb-icon");
 }
 
 // Rainbow shown on the "custom color" swatch when a preset is active.
@@ -470,6 +536,7 @@ export default class EpubReaderPlugin extends Plugin {
 		if (!record || record.highlights.length === 0) return null;
 
 		const ep = this.exportPrefs;
+		const bookTitle = path.split("/").pop()?.replace(/\.epub$/i, "") ?? "";
 		const picked = ids ? record.highlights.filter((h) => ids.has(h.id)) : record.highlights;
 		if (picked.length === 0) return null;
 		const sorted = [...picked].sort((a, b) => compareHighlights(a, b, ep.sortBy));
@@ -496,11 +563,36 @@ export default class EpubReaderPlugin extends Plugin {
 
 		let n = 0;
 		for (const [key, items] of groups) {
-			if (key) lines.push(`## ${key}`, "");
+			// A single group has nothing to separate, so its heading is just noise.
+			if (key && groups.size > 1) lines.push(`## ${key}`, "");
 			for (const h of items) {
 				n++;
+				const text = h.text.replace(/\n+/g, " ");
+				const page = pageLabel?.(h.cfiRange) ?? "";
+				const chapter = chapterLabel?.(h.cfiRange) ?? "";
+				const when = new Date(h.created);
+				if (ep.useTemplate && ep.template.trim()) {
+					// Group headings and the separator stay the plugin's own, so a merge
+					// can still find where one highlight ends and the next begins.
+					lines.push(
+						renderTemplate(ep.template, {
+							index: `${n}`,
+							text,
+							note: h.note ?? "",
+							page: page === "—" ? "" : page,
+							chapter,
+							date: when.toLocaleDateString(),
+							time: when.toLocaleTimeString(),
+							color: colorLabel(h.color),
+							book: bookTitle,
+						}),
+						""
+					);
+					lines.push("---", "");
+					continue;
+				}
 				const num = ep.showIndex ? `**${n}.** ` : "";
-				lines.push(`> ${num}${h.text.replace(/\n+/g, " ")}`);
+				lines.push(`> ${num}${text}`);
 				lines.push("");
 				if (ep.showNote && h.note) {
 					lines.push(`**${tr("备注", "Note", "備註", "Nota")}：** ${h.note}`);
@@ -508,15 +600,11 @@ export default class EpubReaderPlugin extends Plugin {
 				}
 				// Meta line: only the fields that aren't already the group heading.
 				const meta: string[] = [];
-				if (ep.showChapter && ep.groupBy !== "chapter") {
-					const c = chapterLabel?.(h.cfiRange);
-					if (c) meta.push(c);
+				if (ep.showChapter && ep.groupBy !== "chapter" && chapter) meta.push(chapter);
+				if (ep.showPage && page && page !== "—") {
+					meta.push(tr(`第 ${page} 页`, `Page ${page}`, `第 ${page} 頁`, `Pagina ${page}`));
 				}
-				if (ep.showPage) {
-					const page = pageLabel?.(h.cfiRange);
-					if (page && page !== "—") meta.push(tr(`第 ${page} 页`, `Page ${page}`, `第 ${page} 頁`, `Pagina ${page}`));
-				}
-				if (ep.showDate) meta.push(new Date(h.created).toLocaleDateString());
+				if (ep.showDate) meta.push(when.toLocaleDateString());
 				if (ep.showColor && ep.groupBy !== "color") meta.push(colorLabel(h.color));
 				if (meta.length) lines.push(`*${meta.join(" · ")}*`, "");
 				lines.push("---", "");
@@ -527,6 +615,13 @@ export default class EpubReaderPlugin extends Plugin {
 
 	get exportPrefs(): ExportPrefs {
 		if (!this.data.export) this.data.export = { ...DEFAULT_EXPORT };
+		// Prefs written by an earlier version are missing every field added since,
+		// and reading one of those would be undefined. Patch them in place — a fresh
+		// merged object each call would drop mutations made to the previous one.
+		const ex = this.data.export as unknown as Record<string, unknown>;
+		for (const [key, value] of Object.entries(DEFAULT_EXPORT)) {
+			if (ex[key] === undefined) ex[key] = value;
+		}
 		return this.data.export;
 	}
 
@@ -697,18 +792,117 @@ class EpubSettingTab extends PluginSettingTab {
 			{ key: "showColor", label: tr("颜色名称", "Color name", "顏色名稱", "Nome del colore") },
 			{ key: "showIndex", label: tr("序号", "Numbering", "序號", "Numerazione") },
 		];
+		// Both modes are built once and shown or hidden as the switch moves: a full
+		// re-render of the tab is not something a toggle can rely on.
+		const fieldSettings: Setting[] = [];
+		let templateEls: HTMLElement[] = [];
+
+		new Setting(containerEl)
+			.setName(tr("使用自定义模板", "Use a custom template", "使用自訂模板", "Usa un modello personalizzato"))
+			.setDesc(
+				tr(
+					"打开后每条高亮的排版由模板决定，下面的字段开关不再生效；关掉即回到开关模式。首次打开会用与当前开关等效的模板填好。",
+					"With this on, a template decides how each highlight is written and the field toggles below no longer apply; turn it off to return to them. The box is prefilled with the template matching your current toggles.",
+					"打開後每條高亮的排版由模板決定，下面的欄位開關不再生效；關掉即回到開關模式。首次打開會用與目前開關等效的模板填好。",
+					"Con questa opzione un modello decide come viene scritta ogni evidenziazione e gli interruttori non valgono più; disattivala per tornare a loro. Il riquadro viene precompilato con il modello equivalente."
+				)
+			)
+			.addToggle((t) => {
+				t.setValue(ep.useTemplate === true);
+				t.onChange(async (v) => {
+					ep.useTemplate = v;
+					if (v && !ep.template?.trim()) {
+						ep.template = defaultTemplate(ep);
+						box.setValue(ep.template);
+					}
+					syncMode();
+					await this.plugin.saveBookData();
+				});
+			});
+
+		const tplSetting = new Setting(containerEl)
+			.setName(tr("模板", "Template", "模板", "Modello"))
+			.addExtraButton((btn) =>
+				btn
+					.setIcon("rotate-ccw")
+					.setTooltip(tr("恢复默认模板", "Reset to default", "恢復預設模板", "Ripristina il modello"))
+					.onClick(async () => {
+						ep.template = defaultTemplate(ep);
+						box.setValue(ep.template);
+						await this.plugin.saveBookData();
+					})
+			);
+		let box!: TextAreaComponent;
+		tplSetting.addTextArea((ta) => {
+			box = ta;
+			ta.setValue(ep.template || defaultTemplate(ep));
+			ta.inputEl.rows = 12;
+			ta.inputEl.setCssStyles({ width: "100%", minWidth: "260px", fontFamily: "var(--font-monospace)", fontSize: "12px" });
+			// Saved on blur: writing the whole data file on every keystroke would be
+			// wasteful with a plugin data file this size.
+			ta.inputEl.onblur = async () => {
+				if (ta.getValue() === ep.template) return;
+				ep.template = ta.getValue();
+				await this.plugin.saveBookData();
+			};
+		});
+		// Three labelled blocks: a hanging-indent layout wraps badly in the narrow
+		// settings column, so each part gets its own line.
+		tplSetting.descEl.empty();
+		const helpBlock = (label: string, body: string) => {
+			const wrap = tplSetting.descEl.createDiv({ cls: "epub-tpl-help" });
+			wrap.createDiv({ cls: "epub-tpl-help-label", text: label });
+			wrap.createDiv({ text: body });
+		};
+		helpBlock(
+			tr("变量", "Variables", "變數", "Variabili"),
+			tr(
+				"{{index}} 序号 · {{text}} 原文 · {{note}} 备注 · {{page}} 页码 · {{chapter}} 章节 · {{book}} 书名 · {{date}} 日期 · {{time}} 时间 · {{color}} 颜色",
+				"{{index}} · {{text}} · {{note}} · {{page}} · {{chapter}} · {{book}} · {{date}} · {{time}} · {{color}}",
+				"{{index}} 序號 · {{text}} 原文 · {{note}} 備註 · {{page}} 頁碼 · {{chapter}} 章節 · {{book}} 書名 · {{date}} 日期 · {{time}} 時間 · {{color}} 顏色",
+				"{{index}} · {{text}} · {{note}} · {{page}} · {{chapter}} · {{book}} · {{date}} · {{time}} · {{color}}"
+			)
+		);
+		helpBlock(
+			tr("条件", "Condition", "條件", "Condizione"),
+			tr(
+				"{{#note}}…{{/note}} 之间的内容只在备注非空时才输出，换成别的变量名同理",
+				"What sits between {{#note}} and {{/note}} is written only when the note isn't empty; any variable name works the same way",
+				"{{#note}}…{{/note}} 之間的內容只在備註非空時才輸出，換成別的變數名同理",
+				"Ciò che sta tra {{#note}} e {{/note}} viene scritto solo se la nota non è vuota; vale per qualsiasi variabile"
+			)
+		);
+		helpBlock(
+			tr("不用写", "Leave out", "不用寫", "Da omettere"),
+			tr(
+				"分组标题和每条之间的分隔线由插件输出",
+				"Group headings and the separator between entries are written by the plugin",
+				"分組標題和每條之間的分隔線由外掛輸出",
+				"I titoli dei gruppi e il separatore tra le voci li scrive l'estensione"
+			)
+		);
+		templateEls = [tplSetting.settingEl];
+
 		new Setting(containerEl)
 			.setName(tr("导出内容", "Fields to include", "匯出內容", "Campi da includere"))
-			.setDesc(tr("每条高亮下方要带哪些信息。", "Which details each highlight carries.", "每條高亮下方要帶哪些資訊。", "Quali dettagli accompagnano ogni evidenziazione."));
+			.setDesc(tr("每条高亮下方要带哪些信息。", "Which details each highlight carries.", "每條高亮下方要帶哪些資訊。", "Quali dettagli accompagnano ogni evidenziazione."))
+			.then((sect) => fieldSettings.push(sect));
 		for (const f of fields) {
-			new Setting(containerEl).setName(f.label).addToggle((t) => {
+			const row = new Setting(containerEl).setName(f.label).addToggle((t) => {
 				t.setValue(ep[f.key]);
 				t.onChange(async (v) => {
 					ep[f.key] = v;
 					await this.plugin.saveBookData();
 				});
 			});
+			fieldSettings.push(row);
 		}
+
+		const syncMode = () => {
+			for (const el of templateEls) el.setCssStyles({ display: ep.useTemplate ? "" : "none" });
+			for (const st of fieldSettings) st.settingEl.setCssStyles({ display: ep.useTemplate ? "none" : "" });
+		};
+		syncMode();
 
 		new Setting(containerEl)
 			.setName(tr("合并已导出的摘录", "Merge exported notes", "合併已匯出的摘錄", "Unisci le note esportate"))
@@ -740,9 +934,9 @@ class EpubSettingTab extends PluginSettingTab {
 
 class NoteModal extends Modal {
 	private result: string;
-	private onSubmit: (note: string) => void;
+	private onSubmit: (note: string) => void | Promise<void>;
 
-	constructor(app: App, initial: string, onSubmit: (note: string) => void) {
+	constructor(app: App, initial: string, onSubmit: (note: string) => void | Promise<void>) {
 		super(app);
 		this.result = initial;
 		this.onSubmit = onSubmit;
@@ -927,10 +1121,10 @@ function toolbarGuide(): { icon?: string; mark?: string; label: string; desc: st
 			icon: "download",
 			label: tr("导出高亮", "Exporting highlights", "匯出高亮", "Esportare le evidenziazioni"),
 			desc: tr(
-				"1. 高亮菜单 →「选择导出…」打开弹窗，上排挑要导出哪些：「全部」「今日」「章节选择」和色点（色点按书记住上次的选择）\n2. 弹窗底部的「排序」和「导出到」只影响这一次；勾「设为默认」才写回设置\n3. 插件设置里的「导出文件夹」「分组方式」「排序方式」和几个字段开关是全局默认值\n4. 高亮菜单 →「导出为 Markdown」不经过弹窗，直接导出全部\n5. 每次导出都是一个新文件，文件名带日期时间，永不覆盖旧文件",
-				"1. Highlights menu → “Export selected…” opens the dialog; the top row picks what to export: “All”, “Today”, “Select chapter” and the color chips (remembered per book)\n2. “Sort” and “Export to” at the bottom of the dialog affect that one export only; “Set as default” writes them back to settings\n3. “Export folder”, “Group by”, “Sort by” and the field toggles in the plugin settings are the global defaults\n4. Highlights menu → “Export to Markdown” skips the dialog and exports everything\n5. Every export is a new file stamped with the date and time; nothing is ever overwritten",
-				"1. 高亮選單 →「選擇匯出…」開啟彈窗，上排挑要匯出哪些：「全部」「今日」「章節選擇」和色點（色點按書記住上次的選擇）\n2. 彈窗底部的「排序」和「匯出到」只影響這一次；勾「設為預設」才寫回設定\n3. 外掛設定裡的「匯出資料夾」「分組方式」「排序方式」和幾個欄位開關是全域預設值\n4. 高亮選單 →「匯出為 Markdown」不經過彈窗，直接匯出全部\n5. 每次匯出都是一個新檔案，檔名帶日期時間，永不覆蓋舊檔",
-				"1. Menu evidenziazioni → «Esporta selezionate…» apre la finestra; la riga in alto sceglie cosa esportare: «Tutte», «Oggi», «Seleziona capitolo» e i pallini colorati (ricordati per libro)\n2. «Ordina» ed «Esporta in» in fondo alla finestra valgono solo per quella esportazione; «Imposta come predefinito» li riscrive nelle impostazioni\n3. «Cartella di esportazione», «Raggruppa per», «Ordina per» e gli interruttori dei campi nelle impostazioni sono i valori predefiniti globali\n4. Menu evidenziazioni → «Esporta in Markdown» salta la finestra ed esporta tutto\n5. Ogni esportazione crea un nuovo file con data e ora: nulla viene mai sovrascritto"
+				"1. 高亮菜单 →「选择导出…」打开弹窗，上排挑要导出哪些：「全部」「今日」「章节选择」和色点（色点按书记住上次的选择）\n2. 弹窗底部的「排序」和「导出到」只影响这一次；勾「设为默认」才写回设置\n3. 插件设置里的「导出文件夹」「分组方式」「排序方式」和几个字段开关是全局默认值\n4. 高亮菜单 →「导出为 Markdown」不经过弹窗，直接导出全部\n5. 每次导出都是一个新文件，文件名带日期时间，永不覆盖旧文件\n6. 想自己决定每条高亮的排版，打开设置里的「使用自定义模板」，用 {{变量}} 写",
+				"1. Highlights menu → “Export selected…” opens the dialog; the top row picks what to export: “All”, “Today”, “Select chapter” and the color chips (remembered per book)\n2. “Sort” and “Export to” at the bottom of the dialog affect that one export only; “Set as default” writes them back to settings\n3. “Export folder”, “Group by”, “Sort by” and the field toggles in the plugin settings are the global defaults\n4. Highlights menu → “Export to Markdown” skips the dialog and exports everything\n5. Every export is a new file stamped with the date and time; nothing is ever overwritten\n6. To decide the layout of each highlight yourself, turn on “Use a custom template” in the settings and write it with {{variables}}",
+				"1. 高亮選單 →「選擇匯出…」開啟彈窗，上排挑要匯出哪些：「全部」「今日」「章節選擇」和色點（色點按書記住上次的選擇）\n2. 彈窗底部的「排序」和「匯出到」只影響這一次；勾「設為預設」才寫回設定\n3. 外掛設定裡的「匯出資料夾」「分組方式」「排序方式」和幾個欄位開關是全域預設值\n4. 高亮選單 →「匯出為 Markdown」不經過彈窗，直接匯出全部\n5. 每次匯出都是一個新檔案，檔名帶日期時間，永不覆蓋舊檔\n6. 想自己決定每條高亮的排版，打開設定裡的「使用自訂模板」，用 {{變數}} 寫",
+				"1. Menu evidenziazioni → «Esporta selezionate…» apre la finestra; la riga in alto sceglie cosa esportare: «Tutte», «Oggi», «Seleziona capitolo» e i pallini colorati (ricordati per libro)\n2. «Ordina» ed «Esporta in» in fondo alla finestra valgono solo per quella esportazione; «Imposta come predefinito» li riscrive nelle impostazioni\n3. «Cartella di esportazione», «Raggruppa per», «Ordina per» e gli interruttori dei campi nelle impostazioni sono i valori predefiniti globali\n4. Menu evidenziazioni → «Esporta in Markdown» salta la finestra ed esporta tutto\n5. Ogni esportazione crea un nuovo file con data e ora: nulla viene mai sovrascritto\n6. Per decidere tu il layout di ogni evidenziazione, attiva «Usa un modello personalizzato» nelle impostazioni e scrivilo con {{variabili}}"
 			),
 		},
 		{
@@ -1135,6 +1329,8 @@ class MergeExportsModal extends Modal {
 	private picked = new Set<string>();
 	private groupBy: ExportPrefs["groupBy"];
 	private sortBy: ExportPrefs["sortBy"];
+	// Owns what the preview renders, and is unloaded with the modal.
+	private renderHost = new Component();
 	private preview!: HTMLElement;
 
 	constructor(app: App, plugin: EpubReaderPlugin) {
@@ -1146,6 +1342,7 @@ class MergeExportsModal extends Modal {
 
 	onOpen() {
 		const { contentEl } = this;
+		this.renderHost.load();
 		// Same column layout as the export dialog: only the preview scrolls, so the
 		// buttons never get pushed out of sight by a long result.
 		contentEl.setCssStyles({ display: "flex", flexDirection: "column", maxHeight: "76vh" });
@@ -1247,7 +1444,7 @@ class MergeExportsModal extends Modal {
 			text: built.stats,
 			attr: { style: "color:var(--text-muted); padding-bottom:8px; margin-bottom:8px; border-bottom:1px solid var(--background-modifier-border);" },
 		});
-		await MarkdownRenderer.render(this.app, built.md, this.preview.createDiv(), "", this.plugin);
+		await MarkdownRenderer.render(this.app, built.md, this.preview.createDiv(), "", this.renderHost);
 	}
 
 	private async write() {
@@ -1288,16 +1485,36 @@ class MergeExportsModal extends Modal {
 
 		const variants = new Map<string, { block: ParsedBlock; file: TFile }[]>();
 		const loose: string[] = [];
+		const looseSeen = new Set<string>();
 		const kept: string[] = [];
 		let seen = 0;
 		for (const f of files) {
 			const { blocks, outside } = parseExportNote(await this.app.vault.cachedRead(f));
 			for (const b of blocks) {
 				seen++;
-				const id = b.id ?? byText.get(blockQuote(b.raw))?.id ?? null;
+				// A custom template can put the text anywhere, so fall back to looking
+				// for any known highlight inside the whole block. Short highlights
+				// count too — taking the longest match keeps a brief one from
+				// shadowing the longer passage that actually contains it.
+				let hl = byText.get(blockQuote(b.raw));
+				if (!hl) {
+					const flat = b.raw.replace(HL_ID_RE, "").replace(/\s+/g, "");
+					let longest = 0;
+					for (const [text, cand] of byText) {
+						if (text.length >= 4 && text.length > longest && flat.includes(text)) {
+							hl = cand;
+							longest = text.length;
+						}
+					}
+				}
+				const id = b.id ?? hl?.id ?? null;
 				if (!id) {
 					// Unmatched blocks keep the heading they sat under: for a section the
-					// reader wrote themselves, that heading is their own title.
+					// reader wrote themselves, that heading is their own title. The same
+					// leftover appearing in several notes is still one leftover.
+					const key = `${b.heading ?? ""}\u0000${b.raw.replace(/\s+/g, "")}`;
+					if (looseSeen.has(key)) continue;
+					looseSeen.add(key);
 					const head = b.heading ? `### ${b.heading}\n\n` : "";
 					loose.push(`${head}${b.raw}\n\n*${tr("来自", "From", "來自", "Da")} [[${f.basename}]]*`);
 					continue;
@@ -1309,19 +1526,39 @@ class MergeExportsModal extends Modal {
 			if (outside) kept.push(`### ${f.basename}\n\n${outside}`);
 		}
 
-		// One highlight can appear in several notes. Keep the fullest copy, and drop
-		// the others only when they add nothing — identical, or wholly contained in
-		// the one kept. Anything else is a copy the reader changed by hand, so it is
-		// set aside rather than silently discarded.
+		// One highlight can appear in several notes, exported with different
+		// templates, languages or fields — same words, different shape. Comparing
+		// the raw blocks would file every one of those as an edited copy, so compare
+		// what is left after removing the parts the plugin itself wrote: the
+		// highlight's text, its note, and the punctuation, digits and Latin letters
+		// that carry the formatting. Only wording beyond that came from the reader.
 		const byId = new Map<string, ParsedBlock>();
 		const conflicts: string[] = [];
 		const bare = (t: string) => t.replace(/\s+/g, "");
+		const FORMATTING = /[0-9A-Za-z*#>|\-–—·・….,:;/()[\]（）【】「」《》"'“”‘’、。，：；！？!?%]+/g;
+		const residue = (raw: string, h?: Highlight) => {
+			let t = bare(raw.replace(HL_ID_RE, ""));
+			if (h) t = t.replace(bare(h.text), "").replace(bare(h.note ?? ""), "");
+			return t.replace(FORMATTING, "");
+		};
+		const NEW_RUN = 8;
 		for (const [id, vs] of variants) {
 			const best = vs.reduce((x, y) => (y.block.raw.length > x.block.raw.length ? y : x));
 			byId.set(id, best.block);
+			const known_h = known.get(id);
+			const kept = residue(best.block.raw, known_h);
 			for (const v of vs) {
-				if (v === best || bare(best.block.raw).includes(bare(v.block.raw))) continue;
-				conflicts.push(`${v.block.raw}\n\n*${tr("来自", "From", "來自", "Da")} [[${v.file.basename}]]*`);
+				if (v === best) continue;
+				const other = residue(v.block.raw, known_h);
+				if (other.length <= NEW_RUN) continue;
+				let novel = false;
+				for (let i = 0; i + NEW_RUN <= other.length; i++) {
+					if (!kept.includes(other.slice(i, i + NEW_RUN))) {
+						novel = true;
+						break;
+					}
+				}
+				if (novel) conflicts.push(`${v.block.raw}\n\n*${tr("来自", "From", "來自", "Da")} [[${v.file.basename}]]*`);
 			}
 		}
 
@@ -1370,7 +1607,7 @@ class MergeExportsModal extends Modal {
 			"",
 		];
 		for (const [key, items] of groups) {
-			if (key) lines.push(`## ${key}`, "");
+			if (key && groups.size > 1) lines.push(`## ${key}`, "");
 			for (const raw of items) lines.push(raw, "", "---", "");
 		}
 		// Blocks that matched nothing are kept verbatim, so a later merge of this
@@ -1419,15 +1656,16 @@ class MergeExportsModal extends Modal {
 	}
 
 	onClose() {
+		this.renderHost.unload();
 		this.contentEl.empty();
 	}
 }
 
 // Pick an export folder by browsing the vault's folders instead of typing a path.
 class FolderPickerModal extends Modal {
-	private onPick: (path: string) => void;
+	private onPick: (path: string) => void | Promise<void>;
 
-	constructor(app: App, onPick: (path: string) => void) {
+	constructor(app: App, onPick: (path: string) => void | Promise<void>) {
 		super(app);
 		this.onPick = onPick;
 	}

@@ -21,6 +21,7 @@ Read EPUB books directly inside Obsidian, mark them up with color-coded highligh
 - **Recently used colors** — custom colors you have picked stay one click away, and drop off the list once no highlight uses them.
 - **Markdown export** — export all highlights, or just the ones you pick, with control over the folder, grouping, sort order and which details each highlight carries. Every export is a new file stamped with the date and time, so nothing is ever overwritten.
 - **Merge exported notes** — fold several exports of the same book into a single note: duplicates are removed and everything you wrote yourself is preserved. The originals are never modified.
+- **Custom export template** — decide how each highlight is written with `{{text}}`, `{{note}}`, `{{page}}`, `{{chapter}}` and friends, including a conditional block that only appears when a note exists.
 - **First-run guide** — a one-time popup explains the toolbar icons; the same reference lives in the plugin's settings tab.
 
 ## Installation
@@ -66,6 +67,8 @@ Open the highlights menu and choose **Export selected…**. The top row of the d
 **Export to Markdown** in the same menu skips the dialog and exports everything.
 
 The plugin's settings hold the defaults: export folder, grouping (none / by chapter / by color), sort order (book order or the order you highlighted), and toggles for chapter, page number, date, note, color name and numbering.
+
+Turning on **Use a custom template** replaces those toggles with a box where you decide the shape of each entry: `{{index}}`, `{{text}}`, `{{note}}`, `{{page}}`, `{{chapter}}`, `{{book}}`, `{{date}}`, `{{time}}`, `{{color}}`. Anything between `{{#note}}` and `{{/note}}` is written only when a note exists, so entries without one leave no empty label behind. Group headings and the separator between entries stay with the plugin — merging relies on them.
 
 Because every export is its own timestamped file, a book read over several sittings leaves several notes. **Merge exported highlight notes** (command palette, or the button in the settings) folds any of them into one: choose the notes, the grouping and the sort order, preview the result, and it is written to a new file. Duplicate highlights are kept once; anything that matches no highlight — your own writing, or a quote you edited — is preserved under "Other content". The source notes are never touched.
 
