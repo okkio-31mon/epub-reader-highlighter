@@ -12,6 +12,7 @@ Read EPUB books directly inside Obsidian, mark them up with color-coded highligh
 - **Reading position remembered** — close the book (or quit Obsidian) and reopening returns you to the passage where you left off.
 - **Color-coded highlights** — select text and pick a color from the popup, or press **`Cmd/Ctrl+Shift+H`** to highlight with the default color; the default color is remembered across sessions.
 - **Notes on highlights** — attach a comment to any highlight.
+- **Highlight menu** — click a highlight to recolor it (presets, the colors this book already uses, or the wheel), write a note, copy it, or delete it, right where it sits.
 - **Highlights panel** — view every highlight in the current book with its page number, text, and note; jump back to the original location, edit notes, or delete.
 - **Copy as quote** — copy the current selection, or all highlights at once, as `*page · time*` + quote blocks ready to paste into a note.
 - **Undo** — `Cmd/Ctrl+Z` reverses the last highlight or deletion.

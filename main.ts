@@ -465,6 +465,25 @@ export default class EpubReaderPlugin extends Plugin {
 		currentLang = resolveLang(this.data.prefs.language);
 
 		this.registerView(VIEW_TYPE_EPUB, (leaf) => new EpubView(leaf, this));
+
+		// A book's highlights are filed under its vault path, so renaming an epub or
+		// moving it to another folder would otherwise orphan every highlight it has.
+		this.registerEvent(
+			this.app.vault.on("rename", (file, oldPath) => {
+				if (file instanceof TFolder) {
+					// Renaming a folder moves every book inside it at once.
+					const from = `${oldPath}/`;
+					for (const bookPath of Object.keys(this.data.books)) {
+						if (bookPath.startsWith(from)) this.moveBookRecord(bookPath, `${file.path}/${bookPath.slice(from.length)}`);
+					}
+					void this.saveBookData();
+					return;
+				}
+				if (!(file instanceof TFile) || file.extension.toLowerCase() !== "epub") return;
+				this.moveBookRecord(oldPath, file.path);
+				void this.saveBookData();
+			})
+		);
 		this.registerExtensions(["epub"], VIEW_TYPE_EPUB);
 		this.addSettingTab(new EpubSettingTab(this.app, this));
 
@@ -513,6 +532,29 @@ export default class EpubReaderPlugin extends Plugin {
 		for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_EPUB)) {
 			const view = leaf.view;
 			if (view instanceof EpubView && view.file) void view.onLoadFile(view.file);
+		}
+	}
+
+	// Re-file a book's record under its new path, folding it into whatever record
+	// already sits there (a book opened once at the destination leaves an empty
+	// one). Views showing the book follow, so their next save lands in the right
+	// place.
+	moveBookRecord(oldPath: string, newPath: string) {
+		const record = this.data.books[oldPath];
+		if (!record || oldPath === newPath) return;
+		const existing = this.data.books[newPath];
+		if (existing) {
+			const seen = new Set(existing.highlights.map((h) => h.id));
+			for (const h of record.highlights) if (!seen.has(h.id)) existing.highlights.push(h);
+			existing.lastCfi = existing.lastCfi ?? record.lastCfi;
+			existing.colorFilter = existing.colorFilter ?? record.colorFilter;
+		} else {
+			this.data.books[newPath] = record;
+		}
+		delete this.data.books[oldPath];
+		for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_EPUB)) {
+			const view = leaf.view;
+			if (view instanceof EpubView && view.filePath === oldPath) view.filePath = newPath;
 		}
 	}
 
@@ -1175,6 +1217,15 @@ class LegendModal extends Modal {
 }
 
 // Pick which highlights to export to Markdown (all selected by default).
+// Which spine item (chapter file) a CFI belongs to. -1 when it can't be read.
+function cfiSpinePos(cfiRange: string): number {
+	try {
+		return (new EpubCFI(cfiRange) as unknown as { spinePos: number }).spinePos ?? -1;
+	} catch {
+		return -1;
+	}
+}
+
 // Chapter naming for one book: spine index of a CFI, and the TOC label for that
 // index. Used by the export filter and by chapter grouping in the export itself.
 function chapterLookup(book: Book) {
@@ -1190,13 +1241,7 @@ function chapterLookup(book: Book) {
 		}
 	};
 	flatten((book.navigation as unknown as { toc?: { href: string; label: string; subitems?: unknown[] }[] })?.toc ?? []);
-	const posOf = (cfi: string): number => {
-		try {
-			return (new EpubCFI(cfi) as unknown as { spinePos: number }).spinePos ?? -1;
-		} catch {
-			return -1;
-		}
-	};
+	const posOf = cfiSpinePos;
 	// Resolve every TOC entry to a spine index. Matching the href strings directly
 	// fails often (the TOC and the spine disagree on path prefixes and on URL
 	// encoding), so ask the spine to resolve the href first and only fall back to
@@ -2042,7 +2087,7 @@ function wrapRangeWithSpans(
 	range: Range,
 	className: string,
 	cssText: string,
-	onClick: () => void
+	onClick: (ev: MouseEvent) => void
 ): HTMLElement[] {
 	// If the whole selection sits inside one text node, commonAncestorContainer
 	// IS that text node — which has no children, so a TreeWalker rooted there
@@ -2072,7 +2117,7 @@ function wrapRangeWithSpans(
 		nodeRange.surroundContents(span);
 		spans.push(span);
 	}
-	spans.forEach((s) => s.addEventListener("click", onClick));
+	spans.forEach((s) => s.addEventListener("click", (ev) => onClick(ev as MouseEvent)));
 	return spans;
 }
 
@@ -3249,6 +3294,13 @@ class EpubView extends FileView {
 		if (!view?.contents) return;
 
 		for (const h of record.highlights) {
+			// A CFI carries the chapter it belongs to, but resolving one against
+			// another chapter's document doesn't fail — it walks the same node path
+			// there and lands on unrelated text, which then gets painted. Every
+			// highlight has to be matched to its own section first.
+			const pos = cfiSpinePos(h.cfiRange);
+			if (pos >= 0 && pos !== sectionIndex) continue;
+
 			let range: Range;
 			try {
 				range = view.contents.range(h.cfiRange);
@@ -3256,6 +3308,13 @@ class EpubView extends FileView {
 				continue;
 			}
 			if (!range || range.commonAncestorContainer.ownerDocument !== view.contents.document) continue;
+			// Second guard: the text under the range must still be the text that was
+			// highlighted. Protects against a book whose content shifted, and against
+			// a CFI whose spine step couldn't be read above. Invisible characters are
+			// dropped as well as whitespace — a soft hyphen or zero-width space in the
+			// markup would otherwise hide a perfectly good highlight.
+			const bare = (t: string) => t.replace(/[\s\u00ad\u200b-\u200f\ufeff]+/g, "");
+			if (bare(range.toString()) !== bare(h.text)) continue;
 			// Skip if already applied (re-render of a section already on screen).
 			const existing = view.contents.document.querySelector(`[data-hl-id="${h.id}"]`);
 			if (existing) continue;
@@ -3265,7 +3324,7 @@ class EpubView extends FileView {
 				range,
 				"epub-highlight",
 				`background: ${h.color}; cursor: pointer;`,
-				() => this.handleHighlightClick(h.id)
+				(ev) => this.showHighlightMenu(h.id, ev)
 			);
 			spans.forEach((s) => s.setAttribute("data-hl-id", h.id));
 		}
@@ -3474,7 +3533,7 @@ class EpubView extends FileView {
 				domRange,
 				"epub-highlight",
 				`background: ${color}; cursor: pointer;`,
-				() => this.handleHighlightClick(id)
+				(ev) => this.showHighlightMenu(id, ev)
 			);
 			if (spans.length === 0) {
 				new Notice(tr("高亮失败：未找到可包裹的文本节点", "Highlight failed: no wrappable text node found", "高亮失敗：找不到可包裹的文字節點", "Evidenziazione non riuscita: nessun nodo di testo"));
@@ -3491,6 +3550,126 @@ class EpubView extends FileView {
 		} catch (err) {
 			console.error("epub-reader-highlighter: failed to apply highlight", err);
 			new Notice(tr(`高亮失败：${(err as Error).message}`, `Highlight failed: ${(err as Error).message}`, `高亮失敗：${(err as Error).message}`, `Evidenziazione non riuscita: ${(err as Error).message}`));
+		}
+	}
+
+	// Everything you can do to one highlight, next to the highlight itself: recolor
+	// it, write a note, copy it, delete it. Reuses the selection popup's slot, so
+	// an outside click dismisses it the same way.
+	showHighlightMenu(id: string, ev: MouseEvent) {
+		const record = this.plugin.getBookRecord(this.filePath);
+		const highlight = record.highlights.find((h) => h.id === id);
+		if (!highlight) return;
+		ev.stopPropagation();
+		this.dismissColorToolbar();
+
+		const target = ev.target as HTMLElement;
+		const rect = target.getBoundingClientRect();
+		const iframeRect = target.ownerDocument.defaultView?.frameElement?.getBoundingClientRect();
+		const containerRect = this.contentEl.getBoundingClientRect();
+
+		const bar = this.contentEl.createDiv({
+			attr: { style: "position: absolute; z-index: 1000; background: var(--background-secondary); border-radius: 6px; padding: 4px; display: flex; align-items: center; gap: 4px; box-shadow: var(--shadow-s);" },
+		});
+		bar.addEventListener("click", (e) => e.stopPropagation());
+		const top = (iframeRect?.top ?? 0) + rect.top - containerRect.top - 34;
+		const left = (iframeRect?.left ?? 0) + rect.left - containerRect.left;
+		bar.setCssStyles({ top: `${Math.max(top, 0)}px`, left: `${left}px` });
+		this.colorToolbar = bar;
+		this.colorToolbarTs = Date.now();
+
+		// Recolour. The swatch matching the current color carries a ring — a soft
+		// dark grey rather than the accent, which reads as black against pastels.
+		const RING = "2px solid rgba(0, 0, 0, 0.6)";
+		const swatch = (background: string, title: string, selected: boolean) =>
+			bar.createEl("button", {
+				attr: {
+					style: `${FLAT_BTN_STYLE} width: 18px; height: 18px; border-radius: 50%; background: ${background}; outline: ${selected ? RING : "none"}; outline-offset: 1px;`,
+					title,
+				},
+			});
+		const applyColor = async (value: string) => {
+			highlight.color = value;
+			this.recolorInAllViews(id, value);
+			await this.plugin.saveBookData();
+			this.dismissColorToolbar();
+		};
+		for (const c of HIGHLIGHT_COLORS) {
+			swatch(c.value, tr(c.name, c.en, c.tw, c.it), c.value === highlight.color).onclick = () => void applyColor(c.value);
+		}
+		// Custom colors this book already uses, so a palette you built stays reachable
+		// without reopening the picker. Most recently highlighted first: a color just
+		// mixed is the one most likely to be wanted again.
+		const customs = [...record.highlights]
+			.sort((a, b) => b.created - a.created)
+			.map((h) => h.color)
+			.filter((v, i, all) => !HIGHLIGHT_COLORS.some((c) => c.value === v) && all.indexOf(v) === i)
+			.slice(0, 4);
+		for (const value of customs) {
+			swatch(value, colorLabel(value), value === highlight.color).onclick = () => void applyColor(value);
+		}
+		// And the wheel, for a color not used yet.
+		const wheel = swatch(RAINBOW_GRADIENT, tr("自定义颜色…", "Custom color…", "自訂顏色…", "Colore personalizzato…"), false);
+		wheel.onclick = () => {
+			const input = this.contentEl.createEl("input", {
+				attr: { type: "color", style: "position:absolute; width:0; height:0; opacity:0; pointer-events:none;" },
+			});
+			input.value = rgbaToHex(highlight.color);
+			input.addEventListener("change", () => {
+				this.customHlColor = input.value;
+				this.recordCustomColor(input.value);
+				void this.savePrefs();
+				void applyColor(hexToHighlightRgba(input.value));
+				input.remove();
+			});
+			input.click();
+		};
+
+		const sep = bar.createDiv();
+		sep.setCssStyles({ width: "0.8px", height: `${TOOLBAR_ICON_PX}px`, background: "var(--background-modifier-border)", margin: "0 2px" });
+
+		const action = (icon: string, title: string, run: () => void) => {
+			const btn = bar.createEl("button", { attr: { style: `${TOOLBAR_ICON_BTN_STYLE} color: var(--text-normal);`, title } });
+			setIcon(btn, icon);
+			sizeToolbarIcon(btn);
+			btn.onclick = () => {
+				this.dismissColorToolbar();
+				run();
+			};
+		};
+		action(
+			highlight.note ? "pencil" : "message-square-plus",
+			highlight.note ? tr("编辑备注", "Edit note", "編輯備註", "Modifica nota") : tr("添加备注", "Add note", "新增備註", "Aggiungi nota"),
+			() => this.handleHighlightClick(id)
+		);
+		action("copy", tr("复制引用", "Copy quote", "複製引用", "Copia citazione"), () => this.copyQuotes([highlight]));
+		action("trash-2", tr("删除（⌘Z 可撤销）", "Delete (⌘Z to undo)", "刪除（⌘Z 可復原）", "Elimina (⌘Z per annullare)"), () => {
+			void this.deleteHighlight(id);
+		});
+	}
+
+	// Repaint a highlight that changed color, in every view showing this book.
+	recolorInAllViews(id: string, color: string) {
+		for (const view of this.mountedViews()) {
+			view?.contents?.document?.querySelectorAll(`[data-hl-id="${id}"]`).forEach((span: Element) => {
+				span.setAttribute("style", `background: ${color}; cursor: pointer;`);
+			});
+		}
+	}
+
+	async deleteHighlight(id: string) {
+		const record = this.plugin.getBookRecord(this.filePath);
+		const highlight = record.highlights.find((h) => h.id === id);
+		if (!highlight) return;
+		try {
+			this.undoStack.push({ type: "delete", highlight });
+			record.highlights = record.highlights.filter((h) => h.id !== id);
+			await this.plugin.saveBookData();
+			this.unhighlightInAllViews(id);
+			new Notice(tr("已删除（⌘Z 可撤销）", "Deleted (⌘Z to undo)", "已刪除（⌘Z 可復原）", "Eliminato (⌘Z per annullare)"));
+		} catch (err) {
+			console.error("epub-reader-highlighter: failed to delete highlight", err);
+			new Notice(tr(`删除失败：${(err as Error).message}`, `Delete failed: ${(err as Error).message}`, `刪除失敗：${(err as Error).message}`, `Eliminazione non riuscita: ${(err as Error).message}`));
 		}
 	}
 

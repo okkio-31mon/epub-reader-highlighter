@@ -12,6 +12,7 @@ Leggi i libri EPUB direttamente dentro Obsidian, annotali con evidenziazioni col
 - **Posizione di lettura memorizzata** — chiudi il libro (o Obsidian) e alla riapertura torni al passaggio dove avevi lasciato.
 - **Evidenziazioni colorate** — seleziona il testo e scegli un colore dal popup, oppure premi **`Cmd/Ctrl+Shift+H`** per evidenziare con il colore predefinito; il colore predefinito viene ricordato tra le sessioni.
 - **Note sulle evidenziazioni** — aggiungi un commento a qualsiasi evidenziazione.
+- **Menu dell'evidenziazione** — fai clic su un'evidenziazione per cambiarne il colore (predefiniti, i colori già usati nel libro o la ruota), scrivere una nota, copiarla o eliminarla sul posto.
 - **Pannello evidenziazioni** — vedi ogni evidenziazione del libro con numero di pagina, testo e nota; torna al punto originale, modifica le note o elimina.
 - **Copia come citazione** — copia la selezione corrente, o tutte le evidenziazioni insieme, come blocchi `*pagina · ora*` + citazione pronti da incollare in una nota.
 - **Annulla** — `Cmd/Ctrl+Z` annulla l'ultima evidenziazione o eliminazione.
