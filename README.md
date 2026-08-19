@@ -13,6 +13,7 @@ Read EPUB books directly inside Obsidian, mark them up with color-coded highligh
 - **Color-coded highlights** — select text and pick a color from the popup, or press **`Cmd/Ctrl+Shift+H`** to highlight with the default color; the default color is remembered across sessions.
 - **Notes on highlights** — attach a comment to any highlight.
 - **Highlight menu** — click a highlight to recolor it (presets, the colors this book already uses, or the wheel), write a note, copy it, or delete it, right where it sits.
+- **Annotations stored in your vault** — each book's highlights are one file in a folder you choose, so any sync tool carries them and editing one book transfers only that file.
 - **Highlights panel** — view every highlight in the current book with its page number, text, and note; jump back to the original location, edit notes, or delete.
 - **Copy as quote** — copy the current selection, or all highlights at once, as `*page · time*` + quote blocks ready to paste into a note.
 - **Undo** — `Cmd/Ctrl+Z` reverses the last highlight or deletion.
@@ -24,6 +25,14 @@ Read EPUB books directly inside Obsidian, mark them up with color-coded highligh
 - **Merge exported notes** — fold several exports of the same book into a single note: duplicates are removed and everything you wrote yourself is preserved. The originals are never modified.
 - **Custom export template** — decide how each highlight is written with `{{text}}`, `{{note}}`, `{{page}}`, `{{chapter}}` and friends, including a conditional block that only appears when a note exists.
 - **First-run guide** — a one-time popup explains the toolbar icons; the same reference lives in the plugin's settings tab.
+
+## Where annotations are stored
+
+Each book's highlights are kept as one `.json` file in the vault, in the folder set under **Annotation storage** in the plugin settings (`epub-highlights` by default). Because they are ordinary vault files, whatever you already use to sync — Obsidian Sync, remotely-save, git — carries them along, and editing one book only transfers that book's file. Changing the folder moves the existing files with it.
+
+Obsidian's file list doesn't show `.json`, so the folder looks empty in the sidebar; the files are there. Open the vault in your file manager, or turn on **Settings → Files and links → Detect all file extensions**.
+
+A highlight is anchored both by a CFI and by its position in the chapter's text. If the markup around it shifts — a different machine, a neighbouring highlight deleted — the text anchor finds the passage again and repairs the CFI. If the epub file behind a path is replaced by a different one, its annotations are set aside in a file marked as previous rather than drawn over a book they no longer match.
 
 ## Installation
 

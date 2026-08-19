@@ -392,15 +392,6 @@ button.epub-tb-btn:disabled {
 	font-variant-numeric: tabular-nums;
 }
 
-/* Icons in the selection popup: same box as the color swatches beside them, and
-   a stroke Obsidian's .svg-icon rules would otherwise thin out. */
-.epub-tb-icon {
-	width: 18px;
-	height: 18px;
-	flex-shrink: 0;
-	stroke-width: 2;
-	transform: translateY(5%);
-}
 
 /* Template help: one labelled block per idea, so it stays readable when the
    settings column is narrow. */
@@ -410,4 +401,10 @@ button.epub-tb-btn:disabled {
 .epub-tpl-help-label {
 	font-weight: 600;
 	color: var(--text-normal);
+}
+
+/* The swatches in the highlight menu match the color dots beside them. */
+.epub-swatch-dot.epub-swatch-sm {
+	width: 18px;
+	height: 18px;
 }

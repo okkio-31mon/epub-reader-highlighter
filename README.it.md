@@ -13,6 +13,7 @@ Leggi i libri EPUB direttamente dentro Obsidian, annotali con evidenziazioni col
 - **Evidenziazioni colorate** — seleziona il testo e scegli un colore dal popup, oppure premi **`Cmd/Ctrl+Shift+H`** per evidenziare con il colore predefinito; il colore predefinito viene ricordato tra le sessioni.
 - **Note sulle evidenziazioni** — aggiungi un commento a qualsiasi evidenziazione.
 - **Menu dell'evidenziazione** — fai clic su un'evidenziazione per cambiarne il colore (predefiniti, i colori già usati nel libro o la ruota), scrivere una nota, copiarla o eliminarla sul posto.
+- **Annotazioni nella cassaforte** — le evidenziazioni di ogni libro stanno in un file dentro una cartella che scegli tu, così qualsiasi sincronizzazione le porta con sé e modificare un libro trasferisce solo quel file.
 - **Pannello evidenziazioni** — vedi ogni evidenziazione del libro con numero di pagina, testo e nota; torna al punto originale, modifica le note o elimina.
 - **Copia come citazione** — copia la selezione corrente, o tutte le evidenziazioni insieme, come blocchi `*pagina · ora*` + citazione pronti da incollare in una nota.
 - **Annulla** — `Cmd/Ctrl+Z` annulla l'ultima evidenziazione o eliminazione.
@@ -24,6 +25,14 @@ Leggi i libri EPUB direttamente dentro Obsidian, annotali con evidenziazioni col
 - **Unione delle note esportate** — fonde più esportazioni dello stesso libro in una sola: i duplicati vengono rimossi e ciò che hai scritto resta intatto. Gli originali non vengono modificati.
 - **Modello di esportazione personalizzato** — decidi come viene scritta ogni evidenziazione con `{{text}}`, `{{note}}`, `{{page}}`, `{{chapter}}` e altre variabili, con un blocco condizionale che compare solo se esiste una nota.
 - **Guida al primo avvio** — un popup una tantum spiega le icone della barra degli strumenti; lo stesso riferimento resta nella scheda impostazioni del plugin.
+
+## Dove sono conservate le annotazioni
+
+Le evidenziazioni di ogni libro stanno in un file `.json` nella cassaforte, nella cartella indicata sotto **Archiviazione** nelle impostazioni (`epub-highlights` per impostazione predefinita). Essendo normali file della cassaforte, qualsiasi sincronizzazione già in uso — Obsidian Sync, remotely-save, git — li porta con sé, e modificare un libro trasferisce solo il suo file. Cambiando cartella i file esistenti vengono spostati.
+
+Obsidian non elenca i `.json`, quindi nella barra laterale la cartella sembra vuota: i file ci sono. Aprila nel gestore file oppure attiva **Impostazioni → File e collegamenti → Rileva tutte le estensioni**.
+
+Ogni evidenziazione è ancorata sia da un CFI sia dalla sua posizione nel testo del capitolo. Se il markup attorno cambia — un'altra macchina, un'evidenziazione vicina eliminata — l'ancora testuale ritrova il passaggio e ripara il CFI. Se l'epub dietro un percorso viene sostituito da un altro file, le sue annotazioni vengono messe da parte in un file contrassegnato come precedente invece di essere disegnate su un libro che non corrisponde più.
 
 ## Installazione
 

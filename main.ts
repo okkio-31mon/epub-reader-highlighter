@@ -88,6 +88,10 @@ const VIEW_TYPE_EPUB = "epub-reader-view";
 interface Highlight {
 	id: string;
 	cfiRange: string;
+	// Where the passage starts, counted in characters of the chapter's text. A CFI
+	// is a node path, so it goes stale when the markup around it shifts; this
+	// survives that and lets a highlight be found again.
+	offset?: number;
 	text: string;
 	color: string;
 	note: string;
@@ -96,12 +100,10 @@ interface Highlight {
 
 interface BookRecord {
 	highlights: Highlight[];
-	// Cached whole-book pre-pagination: the start CFI of every visual page,
-	// pages per spine section, and the layout key ("WxH|size|font") it was
-	// built for, so reopening at the same layout skips the offscreen scan.
-	visualCfis?: string[];
-	visualCounts?: number[];
-	visualKey?: string;
+	// What the epub looked like when these highlights were made. A different file
+	// under the same path is a different book, and its anchors mean nothing here.
+	bookSize?: number;
+	bookHash?: string;
 	// The color chips ticked last time this book was exported, restored on reopen.
 	colorFilter?: string[];
 	// Last reading position, so reopening the book (even after an Obsidian
@@ -166,12 +168,50 @@ const DEFAULT_EXPORT: ExportPrefs = {
 const HL_BEGIN = "%%epub-hl:begin%%";
 const HL_END = "%%epub-hl:end%%";
 
+// Where each book's annotations live. The folder holds one file per book, as
+// ordinary vault files, so any sync tool carries them and only the book that
+// changed gets transferred.
+interface StoragePrefs {
+	folder: string;
+	// Set once the annotations in data.json have been copied out to that folder.
+	migratedAt?: number;
+}
+
+const DEFAULT_STORAGE: StoragePrefs = { folder: "epub-highlights" };
+
+// One book's file in that folder.
+interface SidecarFile {
+	version: number;
+	book: string;
+	// Set on a file kept aside after the book it belonged to was replaced; the
+	// plugin leaves these alone.
+	archived?: boolean;
+	bookSize?: number;
+	bookHash?: string;
+	highlights: Highlight[];
+	lastCfi?: string;
+	colorFilter?: string[];
+}
+
+// The whole-book pre-pagination cache: the start CFI of every visual page, the
+// pages per spine section, and the layout key ("WxH|size|font") it was built
+// for. It is derived from the window size and font, so it belongs to this
+// device and never to the vault.
+interface VisualCache {
+	cfis: string[];
+	counts: number[];
+	key: string;
+}
+
 interface PluginData {
 	books: Record<string, BookRecord>;
 	prefs: ReadingPrefs;
+	storage?: StoragePrefs;
 	export?: ExportPrefs;
 	// Whether the first-run icon guide has been shown (once ever).
 	seenGuide?: boolean;
+	// The release whose notes were last shown, so an upgrade shows them once.
+	seenVersion?: string;
 }
 
 const DEFAULT_DATA: PluginData = {
@@ -444,10 +484,17 @@ function sizeToolbarIcon(btn: HTMLElement) {
 	if (!svg) return;
 	svg.setAttribute("width", `${TOOLBAR_ICON_PX}`);
 	svg.setAttribute("height", `${TOOLBAR_ICON_PX}`);
-	// The class carries the size, the stroke weight Obsidian's .svg-icon would
-	// otherwise thin, and the nudge that lines the pencil up with the round
-	// swatches beside it.
-	svg.addClass("epub-tb-icon");
+	// setCssStyles is what Obsidian gives an SVGElement — addClass exists only on
+	// HTMLElement, and calling it here threw, taking the rest of the popup with it.
+	// Carries the size, the stroke weight Obsidian's .svg-icon would otherwise
+	// thin, and the nudge that lines the pencil up with the round swatches.
+	svg.setCssStyles({
+		width: `${TOOLBAR_ICON_PX}px`,
+		height: `${TOOLBAR_ICON_PX}px`,
+		flexShrink: "0",
+		strokeWidth: "2",
+		transform: "translateY(5%)",
+	});
 }
 
 // Rainbow shown on the "custom color" swatch when a preset is active.
@@ -455,6 +502,17 @@ const RAINBOW_GRADIENT = "conic-gradient(#f43f5e, #f59e0b, #eab308, #22c55e, #3b
 
 export default class EpubReaderPlugin extends Plugin {
 	data: PluginData = DEFAULT_DATA;
+	// Annotations as they stood in data.json before they moved into the vault.
+	// Kept, never rewritten: a reader who downgrades still finds them there.
+	legacyBooks: Record<string, BookRecord> = {};
+	// bookPath -> the file in the annotations folder holding it.
+	private sidecarFor = new Map<string, string>();
+	// bookPath -> what was last written, so an unchanged book isn't rewritten.
+	private lastWritten = new Map<string, string>();
+	// Files left behind by a book that was renamed; removed after the new one lands.
+	private staleSidecars: string[] = [];
+	// Books whose file name may no longer match, checked on the next write.
+	private renamedBooks = new Set<string>();
 
 	async onload() {
 		const loaded = (await this.loadData()) as Partial<PluginData> | null;
@@ -462,7 +520,23 @@ export default class EpubReaderPlugin extends Plugin {
 		// prefs is a nested object, so merge it explicitly to keep defaults for any
 		// field a previously-saved (older) prefs object is missing.
 		this.data.prefs = Object.assign({}, DEFAULT_DATA.prefs, loaded?.prefs);
+		this.data.storage = Object.assign({}, DEFAULT_STORAGE, loaded?.storage);
 		currentLang = resolveLang(this.data.prefs.language);
+
+		// Annotations live in the vault; data.json keeps the frozen snapshot from
+		// before the move. Derived caches older versions wrote there are dropped
+		// here, so the next save leaves them behind for good.
+		this.legacyBooks = {};
+		for (const [bookPath, rec] of Object.entries(loaded?.books ?? {})) {
+			this.legacyBooks[bookPath] = {
+				highlights: rec.highlights ?? [],
+				lastCfi: rec.lastCfi,
+				colorFilter: rec.colorFilter,
+			};
+		}
+		this.data.books = {};
+		await this.loadSidecars();
+		await this.migrateLegacyBooks();
 
 		this.registerView(VIEW_TYPE_EPUB, (leaf) => new EpubView(leaf, this));
 
@@ -524,7 +598,17 @@ export default class EpubReaderPlugin extends Plugin {
 	}
 
 	async saveBookData() {
-		await this.saveData(this.data);
+		// data.json carries settings and the frozen pre-move snapshot; the live
+		// annotations go to one file per book in the vault.
+		await this.saveData({
+			books: this.legacyBooks,
+			prefs: this.data.prefs,
+			storage: this.data.storage,
+			export: this.data.export,
+			seenGuide: this.data.seenGuide,
+			seenVersion: this.data.seenVersion,
+		});
+		await this.flushSidecars();
 	}
 
 	// Rebuild any open reader views so a language change takes effect immediately.
@@ -533,6 +617,71 @@ export default class EpubReaderPlugin extends Plugin {
 			const view = leaf.view;
 			if (view instanceof EpubView && view.file) void view.onLoadFile(view.file);
 		}
+	}
+
+	// A cheap content fingerprint: the size plus a hash of the first stretch of
+	// bytes. Enough to tell one edition of a book from another.
+	static fingerprint(buffer: ArrayBuffer): string {
+		const bytes = new Uint8Array(buffer, 0, Math.min(buffer.byteLength, 262144));
+		let hash = 0x811c9dc5;
+		for (let i = 0; i < bytes.length; i++) {
+			hash ^= bytes[i];
+			hash = Math.imul(hash, 0x01000193) >>> 0;
+		}
+		return hash.toString(16);
+	}
+
+	// Called when a book is opened. If the file behind the path is a different one
+	// than the highlights were made against, they can never line up again — so the
+	// old file is set aside intact and the book starts fresh.
+	async checkBookFingerprint(bookPath: string, buffer: ArrayBuffer) {
+		const record = this.getBookRecord(bookPath);
+		const size = buffer.byteLength;
+		const hash = EpubReaderPlugin.fingerprint(buffer);
+		if (record.bookSize === undefined || record.bookHash === undefined) {
+			record.bookSize = size;
+			record.bookHash = hash;
+			await this.saveBookData();
+			return;
+		}
+		if (record.bookSize === size && record.bookHash === hash) return;
+		if (record.highlights.length) {
+			const archived = await this.archiveSidecar(bookPath);
+			new Notice(
+				tr(
+					`这本书的文件已更换，原有 ${record.highlights.length} 条批注保留在「${archived ?? "原文件"}」，本书重新开始记录`,
+					`This book's file has been replaced; its ${record.highlights.length} annotations are kept in "${archived ?? "the previous file"}" and the book starts fresh`,
+					`這本書的檔案已更換，原有 ${record.highlights.length} 條批註保留在「${archived ?? "原檔案"}」，本書重新開始記錄`,
+					`Il file di questo libro è stato sostituito; le ${record.highlights.length} annotazioni restano in "${archived ?? "il file precedente"}" e il libro riparte da zero`
+				)
+			);
+		}
+		record.highlights = [];
+		record.lastCfi = undefined;
+		record.bookSize = size;
+		record.bookHash = hash;
+		await this.saveBookData();
+	}
+
+	// Move a book's file aside, flagged so it is never loaded again, and free the
+	// name for the fresh one.
+	private async archiveSidecar(bookPath: string): Promise<string | null> {
+		const current = this.sidecarFor.get(bookPath);
+		if (!current) return null;
+		const adapter = this.app.vault.adapter;
+		const stamp = new Date().toISOString().slice(0, 10);
+		const target = normalizePath(current.replace(/\.json$/i, ` (${tr("旧版", "previous", "舊版", "precedente")} ${stamp}).json`));
+		try {
+			const body = JSON.parse(await adapter.read(current)) as SidecarFile;
+			body.archived = true;
+			await adapter.write(target, JSON.stringify(body, null, "\t"));
+			await adapter.remove(current);
+		} catch {
+			return null;
+		}
+		this.sidecarFor.delete(bookPath);
+		this.lastWritten.delete(bookPath);
+		return target;
 	}
 
 	// Re-file a book's record under its new path, folding it into whatever record
@@ -552,6 +701,16 @@ export default class EpubReaderPlugin extends Plugin {
 			this.data.books[newPath] = record;
 		}
 		delete this.data.books[oldPath];
+		// Keep the same file for now — renaming the folder around a book leaves its
+		// own name unchanged, and the file it lives in is still the right one. The
+		// next write checks whether the name should change and only then swaps it.
+		const previous = this.sidecarFor.get(oldPath);
+		if (previous) {
+			this.sidecarFor.delete(oldPath);
+			this.sidecarFor.set(newPath, previous);
+			this.lastWritten.delete(newPath);
+			this.renamedBooks.add(newPath);
+		}
 		for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_EPUB)) {
 			const view = leaf.view;
 			if (view instanceof EpubView && view.filePath === oldPath) view.filePath = newPath;
@@ -655,6 +814,191 @@ export default class EpubReaderPlugin extends Plugin {
 		return lines.join("\n");
 	}
 
+	get storagePrefs(): StoragePrefs {
+		if (!this.data.storage) this.data.storage = { ...DEFAULT_STORAGE };
+		return this.data.storage;
+	}
+
+	// ---- annotations on disk ----
+
+	private serializeBook(bookPath: string): string {
+		const rec = this.data.books[bookPath];
+		const payload: SidecarFile = {
+			version: 1,
+			book: bookPath,
+			bookSize: rec.bookSize,
+			bookHash: rec.bookHash,
+			highlights: rec.highlights,
+			lastCfi: rec.lastCfi,
+			colorFilter: rec.colorFilter,
+		};
+		return JSON.stringify(payload, null, "\t");
+	}
+
+	// A file named after the book, so the folder stays readable; the book's own
+	// path inside the file is what actually binds the two.
+	private freeSidecarName(bookPath: string, ownedAlready?: string): string {
+		const folder = this.storagePrefs.folder.replace(/^\/+|\/+$/g, "");
+		const dir = folder ? `${folder}/` : "";
+		const stem = (bookPath.split("/").pop() ?? "book").replace(/\.epub$/i, "").replace(/[\\/:*?"<>|]/g, "-");
+		const taken = new Set(this.sidecarFor.values());
+		// The caller's own file doesn't count as taken, or a book would rename its
+		// file every time just to avoid itself.
+		if (ownedAlready) taken.delete(ownedAlready);
+		let name = normalizePath(`${dir}${stem}.json`);
+		for (let n = 2; taken.has(name); n++) name = normalizePath(`${dir}${stem} (${n}).json`);
+		return name;
+	}
+
+	async loadSidecars() {
+		this.sidecarFor.clear();
+		this.lastWritten.clear();
+		const folder = this.storagePrefs.folder.replace(/^\/+|\/+$/g, "");
+		const adapter = this.app.vault.adapter;
+		if (!folder || !(await adapter.exists(folder))) return;
+		const listing = await adapter.list(folder);
+		for (const file of listing.files) {
+			if (!file.toLowerCase().endsWith(".json")) continue;
+			try {
+				const parsed = JSON.parse(await adapter.read(file)) as SidecarFile;
+				if (!parsed?.book || !Array.isArray(parsed.highlights)) continue;
+				if (parsed.archived) continue;
+				this.data.books[parsed.book] = {
+					highlights: parsed.highlights,
+					bookSize: parsed.bookSize,
+					bookHash: parsed.bookHash,
+					lastCfi: parsed.lastCfi,
+					colorFilter: parsed.colorFilter,
+				};
+				this.sidecarFor.set(parsed.book, file);
+				this.lastWritten.set(parsed.book, this.serializeBook(parsed.book));
+			} catch {
+				new Notice(tr(`无法读取批注文件「${file}」`, `Could not read annotation file "${file}"`, `無法讀取批註檔案「${file}」`, `Impossibile leggere il file "${file}"`));
+			}
+		}
+	}
+
+	// Writes only the books whose contents actually changed.
+	private async flushSidecars() {
+		const adapter = this.app.vault.adapter;
+		const folder = this.storagePrefs.folder.replace(/^\/+|\/+$/g, "");
+		for (const [bookPath, rec] of Object.entries(this.data.books)) {
+			// A book that has been opened but not marked up needs no file yet.
+			if (!rec.highlights.length && !rec.lastCfi) continue;
+			const body = this.serializeBook(bookPath);
+			if (this.lastWritten.get(bookPath) === body) continue;
+			if (folder && !(await adapter.exists(folder))) await adapter.mkdir(folder);
+			let target = this.sidecarFor.get(bookPath);
+			if (target && this.renamedBooks.delete(bookPath)) {
+				// The book was renamed: move its file only if the name really changed.
+				const wanted = this.freeSidecarName(bookPath, target);
+				if (wanted !== target) {
+					this.staleSidecars.push(target);
+					target = wanted;
+					this.sidecarFor.set(bookPath, target);
+				}
+			}
+			if (!target) {
+				target = this.freeSidecarName(bookPath);
+				this.sidecarFor.set(bookPath, target);
+			}
+			await adapter.write(target, body);
+			this.lastWritten.set(bookPath, body);
+		}
+		// Only once the replacements are safely written.
+		const inUse = new Set(this.sidecarFor.values());
+		while (this.staleSidecars.length) {
+			const old = this.staleSidecars.pop() as string;
+			// A book may have been re-pointed at this very file in the meantime.
+			if (inUse.has(old)) continue;
+			try {
+				if (await adapter.exists(old)) await adapter.remove(old);
+			} catch {
+				// A file already gone, or removed by hand: nothing to do.
+			}
+		}
+	}
+
+	// One-time move of whatever data.json still holds into the annotations folder.
+	// Idempotent by design: a book already present is merged highlight by
+	// highlight, so a folder synced from another machine is never overwritten.
+	private async migrateLegacyBooks() {
+		const storage = this.storagePrefs;
+		if (storage.migratedAt) return;
+		const carried = Object.entries(this.legacyBooks).filter(([, r]) => r.highlights.length > 0 || r.lastCfi);
+		if (carried.length) {
+			await this.writeMigrationBackup();
+			for (const [bookPath, rec] of carried) {
+				const live = this.data.books[bookPath];
+				if (!live) {
+					this.data.books[bookPath] = { highlights: [...rec.highlights], lastCfi: rec.lastCfi, colorFilter: rec.colorFilter };
+					continue;
+				}
+				const seen = new Set(live.highlights.map((h) => h.id));
+				for (const h of rec.highlights) if (!seen.has(h.id)) live.highlights.push(h);
+				live.lastCfi = live.lastCfi ?? rec.lastCfi;
+			}
+			new Notice(
+				tr(
+					`批注已移到「${storage.folder}」（${carried.length} 本书），data.json 里的原始副本保留未动`,
+					`Annotations moved to "${storage.folder}" (${carried.length} books); the original copy in data.json is left untouched`,
+					`批註已移到「${storage.folder}」（${carried.length} 本書），data.json 裡的原始副本保留未動`,
+					`Annotazioni spostate in "${storage.folder}" (${carried.length} libri); la copia originale in data.json resta intatta`
+				)
+			);
+		}
+		storage.migratedAt = Date.now();
+		await this.saveBookData();
+	}
+
+	private async writeMigrationBackup() {
+		const dir = this.manifest.dir;
+		if (!dir) return;
+		const adapter = this.app.vault.adapter;
+		const target = normalizePath(`${dir}/data-backup-${this.manifest.version}.json`);
+		try {
+			if (await adapter.exists(target)) return;
+			const source = normalizePath(`${dir}/data.json`);
+			if (await adapter.exists(source)) await adapter.write(target, await adapter.read(source));
+		} catch {
+			new Notice(tr("批注备份写入失败，已中止迁移", "Could not write the annotation backup; migration stopped", "批註備份寫入失敗，已中止遷移", "Backup non riuscito; migrazione interrotta"));
+			throw new Error("backup failed");
+		}
+	}
+
+	// Point the annotations at another folder, carrying the existing files over:
+	// everything is rewritten there, and the old copies are removed afterwards.
+	async setAnnotationFolder(folder: string): Promise<number> {
+		const clean = folder.replace(/^\/+|\/+$/g, "");
+		if (clean === this.storagePrefs.folder) return 0;
+		for (const file of this.sidecarFor.values()) this.staleSidecars.push(file);
+		this.sidecarFor.clear();
+		this.lastWritten.clear();
+		this.storagePrefs.folder = clean;
+		await this.saveBookData();
+		return this.sidecarFor.size;
+	}
+
+	// How many books currently have a file of their own.
+	annotationFileCount(): number {
+		return this.sidecarFor.size;
+	}
+
+	// ---- per-device pagination cache ----
+
+	private visualCacheKey(bookPath: string): string {
+		return `epub-reader-highlighter:pages:${bookPath}`;
+	}
+
+	loadVisualCache(bookPath: string): VisualCache | null {
+		const raw = this.app.loadLocalStorage(this.visualCacheKey(bookPath)) as VisualCache | null;
+		return raw && Array.isArray(raw.cfis) && Array.isArray(raw.counts) ? raw : null;
+	}
+
+	saveVisualCache(bookPath: string, cache: VisualCache) {
+		this.app.saveLocalStorage(this.visualCacheKey(bookPath), cache);
+	}
+
 	get exportPrefs(): ExportPrefs {
 		if (!this.data.export) this.data.export = { ...DEFAULT_EXPORT };
 		// Prefs written by an earlier version are missing every field added since,
@@ -732,6 +1076,38 @@ class EpubSettingTab extends PluginSettingTab {
 		this.plugin = plugin;
 	}
 
+	// Changing the folder moves every annotation file, so it asks first and says
+	// what happened afterwards.
+	private moveAnnotations(folder: string, revert?: () => void) {
+		const clean = folder.replace(/^\/+|\/+$/g, "");
+		if (clean === this.plugin.storagePrefs.folder) return;
+		const count = this.plugin.annotationFileCount();
+		new ConfirmModal(
+			this.app,
+			tr(
+				`将把 ${count} 个批注文件移到「${clean || "库根目录"}」，原位置的文件会在移动完成后删除。`,
+				`${count} annotation files will be moved to "${clean || "the vault root"}"; the originals are removed once the move finishes.`,
+				`將把 ${count} 個批註檔案移到「${clean || "庫根目錄"}」，原位置的檔案會在移動完成後刪除。`,
+				`${count} file di annotazioni verranno spostati in "${clean || "la radice"}"; gli originali sono rimossi al termine.`
+			),
+			tr("移动", "Move", "移動", "Sposta"),
+			() => {
+				void this.plugin.setAnnotationFolder(clean).then((moved) => {
+					new Notice(
+						tr(
+							`已移动 ${moved} 个批注文件到「${clean || "库根目录"}」`,
+							`Moved ${moved} annotation files to "${clean || "the vault root"}"`,
+							`已移動 ${moved} 個批註檔案到「${clean || "庫根目錄"}」`,
+							`Spostati ${moved} file in "${clean || "la radice"}"`
+						)
+					);
+					this.display();
+				});
+			},
+			revert
+		).open();
+	}
+
 	display() {
 		const { containerEl } = this;
 		containerEl.empty();
@@ -756,6 +1132,33 @@ class EpubSettingTab extends PluginSettingTab {
 					this.display();
 				});
 			});
+
+		// ---- Storage ----
+		new Setting(containerEl).setName(tr("批注存储", "Annotation storage", "批註儲存", "Archiviazione")).setHeading();
+		new Setting(containerEl)
+			.setName(tr("批注文件夹", "Annotation folder", "批註資料夾", "Cartella delle annotazioni"))
+			.setDesc(
+				tr(
+					"1. 每本书的高亮存成这个文件夹里的一个 .json 文件\n2. 文件在你的库里，任何同步工具都会带上；修改一本书只会传输相关文件\n3. 换文件夹时，既有的文件会同步搬运\n4. Obsidian 默认不显示 .json，所以侧边栏里这个文件夹看起来是空的。可用访达打开库文件夹，或到「选项 → 文件与链接 → 检测所有文件扩展名」打开显示",
+					"1. Each book's highlights are one .json file in this folder\n2. The files sit in your vault, so any sync tool carries them; editing one book transfers only the files involved\n3. Changing the folder moves the existing files along with it\n4. Obsidian doesn't show .json by default, so this folder looks empty in the sidebar. Open the vault in your file manager, or turn on Settings → Files and links → Detect all file extensions",
+					"1. 每本書的高亮存成這個資料夾裡的一個 .json 檔案\n2. 檔案在你的庫裡，任何同步工具都會帶上；修改一本書只會傳輸相關檔案\n3. 換資料夾時，既有的檔案會同步搬運\n4. Obsidian 預設不顯示 .json，所以側邊欄裡這個資料夾看起來是空的。可用 Finder 開啟庫資料夾，或到「選項 → 檔案與連結 → 偵測所有副檔名」打開顯示",
+					"1. Le evidenziazioni di ogni libro stanno in un file .json di questa cartella\n2. I file sono nella cassaforte, quindi qualsiasi sincronizzazione li porta con sé; modificare un libro trasferisce solo i file interessati\n3. Cambiando cartella i file esistenti vengono spostati insieme\n4. Obsidian non mostra i .json, quindi nella barra laterale la cartella sembra vuota. Aprila nel gestore file oppure attiva Impostazioni → File e collegamenti → Rileva tutte le estensioni"
+				)
+			)
+			.then((row) => row.descEl.setCssStyles({ whiteSpace: "pre-line" }))
+			.addText((t) => {
+				t.setPlaceholder(DEFAULT_STORAGE.folder);
+				t.setValue(this.plugin.storagePrefs.folder);
+				t.inputEl.onblur = () => this.moveAnnotations(t.getValue().trim() || DEFAULT_STORAGE.folder, () => t.setValue(this.plugin.storagePrefs.folder));
+			})
+			.addExtraButton((b) =>
+				b
+					.setIcon("folder")
+					.setTooltip(tr("浏览文件夹", "Browse folders", "瀏覽資料夾", "Sfoglia le cartelle"))
+					.onClick(() =>
+						new FolderPickerModal(this.app, (f) => this.moveAnnotations(f || DEFAULT_STORAGE.folder)).open()
+					)
+			);
 
 		// ---- Export ----
 		new Setting(containerEl).setName(tr("导出", "Export", "匯出", "Esportazione")).setHeading();
@@ -958,6 +1361,17 @@ class EpubSettingTab extends PluginSettingTab {
 			)
 			.addButton((b) =>
 				b.setButtonText(tr("打开", "Open", "開啟", "Apri")).onClick(() => new MergeExportsModal(this.app, this.plugin).open())
+			);
+
+		new Setting(containerEl)
+			.setName(tr("更新记录", "Changelog", "更新記錄", "Registro delle modifiche"))
+			.setDesc(tr(`当前版本 ${RELEASE_NOTES[0].version}`, `Version ${RELEASE_NOTES[0].version}`, `目前版本 ${RELEASE_NOTES[0].version}`, `Versione ${RELEASE_NOTES[0].version}`))
+			.addButton((b) =>
+				b
+					.setButtonText(tr("查看", "Open", "檢視", "Apri"))
+					.onClick(() =>
+						new WhatsNewModal(this.app, RELEASE_NOTES, tr("更新记录", "Changelog", "更新記錄", "Registro delle modifiche")).open()
+					)
 			);
 
 		// Icon guide — the same reference shown once on first open.
@@ -1184,6 +1598,152 @@ function toolbarGuide(): { icon?: string; mark?: string; label: string; desc: st
 		{ label: tr("自动保存", "Auto-save", "自動儲存", "Salvataggio"), desc: tr("阅读位置、偏好和高亮都会自动保存，重新打开回到上次读到的地方", "Reading position, preferences and highlights are saved automatically; reopening returns to where you left off", "閱讀位置、偏好和高亮都會自動儲存，重新開啟回到上次讀到的地方", "Posizione di lettura, preferenze ed evidenziazioni si salvano da sole; alla riapertura torni dove avevi lasciato") },
 		{ label: tr("快捷键", "Shortcuts", "快捷鍵", "Scorciatoie"), desc: tr("⌘⇧H 高亮选中文字；⌘Z 撤销高亮", "Cmd/Ctrl+Shift+H highlights the selection; Cmd/Ctrl+Z undoes it", "⌘⇧H 高亮選取文字；⌘Z 復原高亮", "Cmd/Ctrl+Maiusc+H evidenzia la selezione; Cmd/Ctrl+Z annulla") },
 	];
+}
+
+// What changed in this release, shown once after an upgrade. Keep it to the
+// things a reader would otherwise have to discover by accident; the full guide
+// is one button away.
+const RELEASE_NOTES: { version: string; lines: () => string[] }[] = [
+	{
+		version: "0.4.0",
+		lines: () => [
+			tr(
+				"批注改为每本书一个文件，存放在库内的「epub-highlights」文件夹，位置可在设置中修改；任何更改都会同步变动",
+				"Annotations are stored as one file per book in the vault's “epub-highlights” folder, configurable in the settings; changes sync along with the rest of the vault",
+				"批註改為每本書一個檔案，存放在庫內的「epub-highlights」資料夾，位置可在設定中修改；任何更改都會同步變動",
+				"Le annotazioni sono un file per libro nella cartella «epub-highlights», configurabile nelle impostazioni; le modifiche si sincronizzano con il resto della cassaforte"
+			),
+			tr(
+				"高亮定位失效时会按原文重新找回并自动修复，换机器或删除相邻高亮不再导致高亮消失",
+				"A highlight whose anchor no longer lands on its passage is found again by its text and repaired, so it no longer disappears after switching machines or deleting a neighbouring highlight",
+				"高亮定位失效時會按原文重新找回並自動修復，換機器或刪除相鄰高亮不再導致高亮消失",
+				"Un'evidenziazione la cui ancora non trova più il passaggio viene ritrovata dal testo e riparata: non sparisce più cambiando macchina o eliminando quella accanto"
+			),
+			tr(
+				"在已有高亮上重新划线时合并为一条，采用新的范围和颜色",
+				"Highlighting over existing highlights folds them into one, with the new extent and color",
+				"在已有高亮上重新劃線時合併為一條，採用新的範圍和顏色",
+				"Evidenziare sopra evidenziazioni esistenti le unisce in una, con la nuova estensione e il nuovo colore"
+			),
+			tr(
+				"文件被更换时会被识别，原有批注保留在标记为旧版的文件中",
+				"A replaced book file is recognised, and the earlier annotations are kept in a file marked as previous",
+				"檔案被更換時會被識別，原有批註保留在標記為舊版的檔案中",
+				"La sostituzione del file di un libro viene riconosciuta e le annotazioni precedenti restano in un file contrassegnato come precedente"
+			),
+			tr(
+				"分页缓存改为本机存储，不再随库同步，插件数据文件体积大幅下降",
+				"The pagination cache is kept on the device rather than in the vault, cutting the plugin's data file down sharply",
+				"分頁快取改為本機儲存，不再隨庫同步，外掛資料檔案體積大幅下降",
+				"La cache di impaginazione resta sul dispositivo, riducendo molto il file dati dell'estensione"
+			),
+		],
+	},
+	{
+		version: "0.3.2",
+		lines: () => [
+			tr(
+				"修复在非所属章节显示高亮的问题",
+				"Fixed highlights being drawn in chapters they do not belong to",
+				"修復在非所屬章節顯示高亮的問題",
+				"Corretto il disegno delle evidenziazioni in capitoli a cui non appartengono"
+			),
+			tr(
+				"重命名或移动书籍、以及重命名其所在文件夹时，高亮记录随之更新",
+				"Highlights follow a book that is renamed or moved, including a rename of the folder containing it",
+				"重新命名或移動書籍、以及重新命名其所在資料夾時，高亮記錄隨之更新",
+				"Le evidenziazioni seguono il libro rinominato o spostato, anche rinominando la cartella che lo contiene"
+			),
+			tr(
+				"点击高亮显示操作栏：更换颜色、编辑备注、复制、删除",
+				"Clicking a highlight opens a menu: change color, edit note, copy, delete",
+				"點擊高亮顯示操作列：更換顏色、編輯備註、複製、刪除",
+				"Facendo clic su un'evidenziazione compare un menu: colore, nota, copia, elimina"
+			),
+		],
+	},
+	{
+		version: "0.3.1",
+		lines: () => [
+			tr(
+				"支持自定义导出模板，可用变量编排每条高亮的排版",
+				"Custom export templates, with variables that lay out each highlight",
+				"支援自訂匯出模板，可用變數編排每條高亮的排版",
+				"Modelli di esportazione personalizzati, con variabili per comporre ogni evidenziazione"
+			),
+			tr(
+				"改进合并：识别自定义格式、匹配短句；内容完全被涵盖的副本会丢弃，有额外内容的副本保留在文末",
+				"Merging recognises custom formats and matches short highlights; a copy whose content is already covered is dropped, one carrying anything extra is kept at the end of the note",
+				"改進合併：辨識自訂格式、比對短句；內容完全被涵蓋的副本會丟棄，有額外內容的副本保留在文末",
+				"L'unione riconosce i formati personalizzati e abbina le evidenziazioni brevi; una copia già contenuta viene scartata, una con contenuto in più resta in fondo alla nota"
+			),
+		],
+	},
+	{
+		version: "0.3.0",
+		lines: () => [
+			tr(
+				"导出设置：目标文件夹、分组方式、排序方式、字段开关",
+				"Export settings: target folder, grouping, sort order, field toggles",
+				"匯出設定：目標資料夾、分組方式、排序方式、欄位開關",
+				"Impostazioni di esportazione: cartella, raggruppamento, ordinamento, campi"
+			),
+			tr(
+				"新增合并功能，可将同一本书的多份导出合成一份",
+				"Added merging, folding several exports of one book into a single note",
+				"新增合併功能，可將同一本書的多份匯出合成一份",
+				"Aggiunta l'unione di più esportazioni dello stesso libro in una nota"
+			),
+		],
+	},
+];
+
+// Semver-ish ordering, enough to tell which entries a reader hasn't seen.
+function versionRank(v: string): number {
+	const [a = 0, b = 0, c = 0] = v.split(".").map((n) => parseInt(n, 10) || 0);
+	return a * 1e6 + b * 1e3 + c;
+}
+
+// Everything released since the version last seen. An unknown last-seen version
+// (or none) shows just the newest entry rather than the whole history.
+function notesSince(seen: string | undefined): typeof RELEASE_NOTES {
+	if (!seen) return RELEASE_NOTES.slice(0, 1);
+	return RELEASE_NOTES.filter((n) => versionRank(n.version) > versionRank(seen));
+}
+
+// Shown on the first book opened after an upgrade, so a change nobody asked to
+// see doesn't go unnoticed.
+class WhatsNewModal extends Modal {
+	private entries: typeof RELEASE_NOTES;
+	private heading: string;
+
+	constructor(app: App, entries: typeof RELEASE_NOTES, heading?: string) {
+		super(app);
+		this.entries = entries.length ? entries : RELEASE_NOTES.slice(0, 1);
+		this.heading = heading ?? tr("新版本", "What's new", "新版本", "Novità");
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.createEl("h3", { text: this.heading, attr: { style: "margin-top: 0;" } });
+		for (const entry of this.entries) {
+			contentEl.createEl("div", { text: entry.version, attr: { style: "font-weight:600; margin-top:8px;" } });
+			const list = contentEl.createEl("ul");
+			for (const line of entry.lines()) list.createEl("li", { text: line, attr: { style: "margin-bottom: 6px;" } });
+		}
+		const row = contentEl.createDiv({ attr: { style: "margin-top:12px; display:flex; justify-content:flex-end; gap:8px;" } });
+		const guide = row.createEl("button", { text: tr("使用说明", "Quick guide", "使用說明", "Guida rapida") });
+		guide.onclick = () => {
+			this.close();
+			new LegendModal(this.app).open();
+		};
+		const ok = row.createEl("button", { cls: "mod-cta", text: tr("知道了", "Got it", "知道了", "Ho capito") });
+		ok.onclick = () => this.close();
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
 }
 
 // First-run guide: what the toolbar icons do. Shown once, then reachable any
@@ -1706,6 +2266,42 @@ class MergeExportsModal extends Modal {
 	}
 }
 
+// A yes/no dialog for the one action that moves files around on its own.
+class ConfirmModal extends Modal {
+	private body: string;
+	private confirmText: string;
+	private onConfirm: () => void;
+	private decided = false;
+	private onCancel?: () => void;
+
+	constructor(app: App, body: string, confirmText: string, onConfirm: () => void, onCancel?: () => void) {
+		super(app);
+		this.body = body;
+		this.confirmText = confirmText;
+		this.onConfirm = onConfirm;
+		this.onCancel = onCancel;
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.createEl("p", { text: this.body, attr: { style: "margin-top: 0;" } });
+		const row = contentEl.createDiv({ attr: { style: "display:flex; justify-content:flex-end; gap:8px;" } });
+		const cancel = row.createEl("button", { text: tr("取消", "Cancel", "取消", "Annulla") });
+		cancel.onclick = () => this.close();
+		const ok = row.createEl("button", { cls: "mod-cta", text: this.confirmText });
+		ok.onclick = () => {
+			this.decided = true;
+			this.close();
+			this.onConfirm();
+		};
+	}
+
+	onClose() {
+		if (!this.decided) this.onCancel?.();
+		this.contentEl.empty();
+	}
+}
+
 // Pick an export folder by browsing the vault's folders instead of typing a path.
 class FolderPickerModal extends Modal {
 	private onPick: (path: string) => void | Promise<void>;
@@ -2077,6 +2673,43 @@ function formatQuote(pageLabel: string, timeMs: number, text: string, note: stri
 	const meta = [where, time].filter(Boolean).join(" · ");
 	const noteLine = note ? `\n${tr("备注", "Note", "備註", "Nota")}：${note}` : "";
 	return `*${meta}*\n> ${text.replace(/\n+/g, " ")}${noteLine}`;
+}
+
+// Where a range starts and ends counted in characters of `root`'s text. Node
+// paths shift the moment spans are unwrapped; character offsets don't.
+function textOffsetsOf(root: Node, range: Range, doc: Document): { start: number; end: number } | null {
+	const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+	let seen = 0;
+	let start = -1;
+	let end = -1;
+	for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+		const len = node.textContent?.length ?? 0;
+		if (node === range.startContainer) start = seen + range.startOffset;
+		if (node === range.endContainer) end = seen + range.endOffset;
+		seen += len;
+	}
+	return start >= 0 && end > start ? { start, end } : null;
+}
+
+// The inverse, run after the DOM has been rearranged.
+function rangeFromTextOffsets(root: Node, start: number, end: number, doc: Document): Range | null {
+	const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+	const range = doc.createRange();
+	let seen = 0;
+	let placedStart = false;
+	for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+		const len = node.textContent?.length ?? 0;
+		if (!placedStart && seen + len > start) {
+			range.setStart(node, start - seen);
+			placedStart = true;
+		}
+		if (placedStart && seen + len >= end) {
+			range.setEnd(node, end - seen);
+			return range;
+		}
+		seen += len;
+	}
+	return null;
 }
 
 // Wraps every text node intersecting `range` in its own <span>, since a Range
@@ -2612,16 +3245,28 @@ class EpubView extends FileView {
 
 		if (!reusingBook) {
 			const arrayBuffer = await this.app.vault.readBinary(file);
+			await this.plugin.checkBookFingerprint(file.path, arrayBuffer);
 			this.book = ePub(arrayBuffer);
 		}
 		await this.renderBook();
 
-		// First ever open: show the icon guide once, then never automatically again
-		// (it stays reachable from the settings tab).
+		// First ever open: the icon guide. After that, only when the version the
+		// reader last saw isn't this one — an upgrade they didn't ask for shouldn't
+		// change things silently. Both stay reachable from the settings tab.
+		const latest = RELEASE_NOTES[0].version;
 		if (!this.plugin.data.seenGuide) {
+			// A fresh install: the guide already describes everything the plugin does,
+			// so there is nothing to catch up on.
 			this.plugin.data.seenGuide = true;
+			this.plugin.data.seenVersion = latest;
 			void this.plugin.saveBookData();
 			new LegendModal(this.app).open();
+		} else if (this.plugin.data.seenVersion !== latest) {
+			const missed = notesSince(this.plugin.data.seenVersion);
+			this.plugin.data.seenVersion = latest;
+			void this.plugin.saveBookData();
+			if (missed.length) new WhatsNewModal(this.app, missed).open();
+
 		}
 	}
 
@@ -2883,10 +3528,10 @@ class EpubView extends FileView {
 		await this.book.ready;
 		if (gen !== this.visualGen) return;
 		const key = this.layoutKey();
-		const record = this.plugin.getBookRecord(this.filePath);
 		// A cached scan for this exact layout → adopt it instantly.
-		if (record.visualKey === key && record.visualCfis?.length && record.visualCounts?.length) {
-			this.adoptVisualPages(record.visualCfis, record.visualCounts, key);
+		const cached = this.plugin.loadVisualCache(this.filePath);
+		if (cached && cached.key === key && cached.cfis.length && cached.counts.length) {
+			this.adoptVisualPages(cached.cfis, cached.counts, key);
 			return;
 		}
 		const w = this.container?.clientWidth ?? 0;
@@ -2960,10 +3605,9 @@ class EpubView extends FileView {
 			off.remove();
 		}
 		if (gen !== this.visualGen || cfis.length === 0) return;
-		record.visualCfis = cfis;
-		record.visualCounts = counts;
-		record.visualKey = key;
-		void this.plugin.saveBookData();
+		// Per-device: stored outside the vault, so it is never synced and never
+		// makes the plugin's own data file bigger.
+		this.plugin.saveVisualCache(this.filePath, { cfis, counts, key });
 		this.adoptVisualPages(cfis, counts, key);
 	}
 
@@ -3282,9 +3926,16 @@ class EpubView extends FileView {
 	unhighlightInAllViews(id: string) {
 		for (const view of this.mountedViews()) {
 			const doc = view?.contents?.document;
+			const parents = new Set<Node>();
 			doc?.querySelectorAll(`[data-hl-id="${id}"]`).forEach((span: Element) => {
+				if (span.parentNode) parents.add(span.parentNode);
 				span.replaceWith(...Array.from(span.childNodes));
 			});
+			// Unwrapping leaves the text in fragments where the span used to split
+			// it. They look identical but shift every node path after them, so the
+			// CFI of any other highlight there would resolve to the wrong words.
+			// Merging them back restores the structure those CFIs were written for.
+			for (const parent of parents) (parent as Element).normalize();
 		}
 	}
 
@@ -3292,6 +3943,9 @@ class EpubView extends FileView {
 		const record = this.plugin.getBookRecord(this.filePath);
 		const view = this.mountedViews().find((v) => v.section?.index === sectionIndex);
 		if (!view?.contents) return;
+		// Set when a highlight had to be found by its text, so the repaired anchors
+		// are written back once rather than after every single one.
+		let rehomed = false;
 
 		for (const h of record.highlights) {
 			// A CFI carries the chapter it belongs to, but resolving one against
@@ -3301,20 +3955,30 @@ class EpubView extends FileView {
 			const pos = cfiSpinePos(h.cfiRange);
 			if (pos >= 0 && pos !== sectionIndex) continue;
 
-			let range: Range;
+			let range: Range | null = null;
 			try {
 				range = view.contents.range(h.cfiRange);
 			} catch {
-				continue;
+				range = null;
 			}
-			if (!range || range.commonAncestorContainer.ownerDocument !== view.contents.document) continue;
+			if (range && range.commonAncestorContainer.ownerDocument !== view.contents.document) range = null;
 			// Second guard: the text under the range must still be the text that was
 			// highlighted. Protects against a book whose content shifted, and against
 			// a CFI whose spine step couldn't be read above. Invisible characters are
 			// dropped as well as whitespace — a soft hyphen or zero-width space in the
 			// markup would otherwise hide a perfectly good highlight.
 			const bare = (t: string) => t.replace(/[\s\u00ad\u200b-\u200f\ufeff]+/g, "");
-			if (bare(range.toString()) !== bare(h.text)) continue;
+			if (!range || bare(range.toString()) !== bare(h.text)) {
+				// The anchor no longer lands on the passage — markup around it moved,
+				// or another machine rendered the chapter differently. Look the text up
+				// instead and re-anchor to where it actually is now.
+				const found = this.locateByText(h, view.contents.document);
+				if (!found) continue;
+				range = found;
+				h.cfiRange = view.contents.cfiFromRange(found);
+				h.offset = view.contents.document.body ? (textOffsetsOf(view.contents.document.body, found, view.contents.document)?.start ?? h.offset) : h.offset;
+				rehomed = true;
+			}
 			// Skip if already applied (re-render of a section already on screen).
 			const existing = view.contents.document.querySelector(`[data-hl-id="${h.id}"]`);
 			if (existing) continue;
@@ -3328,6 +3992,21 @@ class EpubView extends FileView {
 			);
 			spans.forEach((s) => s.setAttribute("data-hl-id", h.id));
 		}
+		if (rehomed) void this.plugin.saveBookData();
+	}
+
+	// Find a highlight's passage by its own text, preferring the occurrence closest
+	// to where it used to be — a chapter can repeat a sentence.
+	private locateByText(h: Highlight, doc: Document): Range | null {
+		const body = doc.body;
+		if (!body || !h.text.trim()) return null;
+		const full = body.textContent ?? "";
+		const positions: number[] = [];
+		for (let i = full.indexOf(h.text); i >= 0 && positions.length < 50; i = full.indexOf(h.text, i + 1)) positions.push(i);
+		if (!positions.length) return null;
+		const target = h.offset ?? 0;
+		const best = positions.reduce((a, b) => (Math.abs(b - target) < Math.abs(a - target) ? b : a));
+		return rangeFromTextOffsets(body, best, best + h.text.length, doc);
 	}
 
 	// Pop up the highlight-color palette next to the current text selection.
@@ -3518,13 +4197,75 @@ class EpubView extends FileView {
 	}
 
 	createHighlight(cfiRange: string, text: string, color: string, domRange: Range, doc: Document) {
+		// Highlighting the same passage twice is a change of mind about its color,
+		// not a second highlight. It can't be caught by comparing CFIs: wrapping the
+		// first one in spans changes the node path, so the second CFI over the same
+		// words differs. Compare against what is already painted there instead.
+		// Two highlights must never sit on top of each other: the outer background
+		// hides the inner one and swallows its clicks. Anything the new selection
+		// overlaps is folded into it.
+		// Two highlights must never sit on top of each other: the outer background
+		// hides the inner one and swallows its clicks. Whatever the new selection
+		// runs into is folded into it — the new extent and the new color win,
+		// whether that grows the old one, trims it, or joins several together.
+		let mergedNote = "";
+		const touched = this.highlightsIntersecting(domRange, doc);
+		if (touched.length) {
+			// Unwrapping the old spans rearranges the very nodes this range points
+			// into, so hold the selection as character offsets across the chapter and
+			// rebuild it once the DOM has settled.
+			const offsets = doc.body ? textOffsetsOf(doc.body, domRange, doc) : null;
+			const record = this.plugin.getBookRecord(this.filePath);
+			const ids = new Set(touched.map((t) => t.highlight.id));
+			for (const t of touched) {
+				this.unhighlightInAllViews(t.highlight.id);
+				this.undoStack.push({ type: "delete", highlight: t.highlight });
+			}
+			record.highlights = record.highlights.filter((h) => !ids.has(h.id));
+			// The note travels with the passage; ⌘Z puts the originals back.
+			mergedNote = touched.map((t) => t.highlight.note).filter(Boolean).join("\n");
+			const rebuilt = offsets && doc.body ? rangeFromTextOffsets(doc.body, offsets.start, offsets.end, doc) : null;
+			if (rebuilt) {
+				domRange = rebuilt;
+				text = rebuilt.toString();
+				const contents = this.mountedViews().find((v) => v.contents?.document === doc)?.contents;
+				if (contents) cfiRange = contents.cfiFromRange(rebuilt);
+			}
+			if (touched.length > 1) {
+				new Notice(
+					tr(
+						`已合并 ${touched.length} 条重叠的高亮`,
+						`Merged ${touched.length} overlapping highlights`,
+						`已合併 ${touched.length} 條重疊的高亮`,
+						`Unite ${touched.length} evidenziazioni sovrapposte`
+					)
+				);
+			}
+		}
+
+		// A highlight of this passage that never made it onto the page — its anchor
+		// no longer resolves, so nothing is painted and the DOM check above can't
+		// see it. Re-anchor that one to where the reader just selected instead of
+		// leaving a ghost behind and adding a second entry.
+		const ghost = this.unpaintedHighlightFor(text, cfiRange, doc);
+		if (ghost) {
+			ghost.cfiRange = cfiRange;
+			ghost.color = color;
+			void this.plugin.saveBookData();
+			const spans = wrapRangeWithSpans(doc, domRange, "epub-highlight", `background: ${color}; cursor: pointer;`, (ev) =>
+				this.showHighlightMenu(ghost.id, ev)
+			);
+			spans.forEach((sp) => sp.setAttribute("data-hl-id", ghost.id));
+			return;
+		}
 		const id = `hl-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 		const highlight: Highlight = {
 			id,
 			cfiRange,
+			offset: doc.body ? (textOffsetsOf(doc.body, domRange, doc)?.start ?? undefined) : undefined,
 			text,
 			color,
-			note: "",
+			note: mergedNote,
 			created: Date.now(),
 		};
 		try {
@@ -3578,16 +4319,14 @@ class EpubView extends FileView {
 		this.colorToolbar = bar;
 		this.colorToolbarTs = Date.now();
 
-		// Recolour. The swatch matching the current color carries a ring — a soft
-		// dark grey rather than the accent, which reads as black against pastels.
-		const RING = "2px solid rgba(0, 0, 0, 0.6)";
-		const swatch = (background: string, title: string, selected: boolean) =>
-			bar.createEl("button", {
-				attr: {
-					style: `${FLAT_BTN_STYLE} width: 18px; height: 18px; border-radius: 50%; background: ${background}; outline: ${selected ? RING : "none"}; outline-offset: 1px;`,
-					title,
-				},
-			});
+		// Recolour. The swatch matching the current color is marked the same way as
+		// everywhere else in the plugin: a white dot in its centre.
+		const swatch = (background: string, title: string, selected: boolean) => {
+			const dot = bar.createEl("button", { cls: "epub-swatch-dot epub-swatch-sm", attr: { title } });
+			dot.setCssStyles({ background });
+			dot.toggleClass("is-active", selected);
+			return dot;
+		};
 		const applyColor = async (value: string) => {
 			highlight.color = value;
 			this.recolorInAllViews(id, value);
@@ -3646,6 +4385,45 @@ class EpubView extends FileView {
 		action("trash-2", tr("删除（⌘Z 可撤销）", "Delete (⌘Z to undo)", "刪除（⌘Z 可復原）", "Elimina (⌘Z per annullare)"), () => {
 			void this.deleteHighlight(id);
 		});
+	}
+
+	// Every painted highlight the given range runs into.
+	private highlightsIntersecting(range: Range, doc: Document): { highlight: Highlight; range: Range }[] {
+		const record = this.plugin.getBookRecord(this.filePath);
+		const byId = new Map<string, Element[]>();
+		for (const span of Array.from(doc.querySelectorAll("[data-hl-id]"))) {
+			const id = span.getAttribute("data-hl-id");
+			if (!id) continue;
+			const list = byId.get(id);
+			if (list) list.push(span);
+			else byId.set(id, [span]);
+		}
+		const out: { highlight: Highlight; range: Range }[] = [];
+		for (const [id, spans] of byId) {
+			const highlight = record.highlights.find((h) => h.id === id);
+			if (!highlight) continue;
+			const other = doc.createRange();
+			other.setStartBefore(spans[0]);
+			other.setEndAfter(spans[spans.length - 1]);
+			if (range.compareBoundaryPoints(Range.END_TO_START, other) >= 0) continue;
+			if (range.compareBoundaryPoints(Range.START_TO_END, other) <= 0) continue;
+			out.push({ highlight, range: other });
+		}
+		return out;
+	}
+
+	// A highlight of the same passage, in the same chapter, that has no spans on
+	// the page: it exists in the data but can't be drawn where it claims to be.
+	private unpaintedHighlightFor(text: string, cfiRange: string, doc: Document): Highlight | null {
+		const bare = (t: string) => t.replace(/\s+/g, "");
+		const wanted = bare(text);
+		const section = cfiSpinePos(cfiRange);
+		const record = this.plugin.getBookRecord(this.filePath);
+		return (
+			record.highlights.find(
+				(h) => bare(h.text) === wanted && cfiSpinePos(h.cfiRange) === section && !doc.querySelector(`[data-hl-id="${h.id}"]`)
+			) ?? null
+		);
 	}
 
 	// Repaint a highlight that changed color, in every view showing this book.
