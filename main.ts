@@ -61,10 +61,7 @@ let loadedSystemFonts: string[] = [];
 function resolveLang(setting: string): Lang {
 	if (setting === "zh" || setting === "en" || setting === "zh-TW" || setting === "it") return setting;
 	// "auto": follow Obsidian's own UI language.
-	// getLanguage() is the supported way, but it only exists on newer Obsidian
-	// builds — older ones still have to be read out of local storage.
-	const raw = typeof getLanguage === "function" ? getLanguage() : window.localStorage.getItem("language");
-	const l = (raw ?? "").toLowerCase();
+	const l = getLanguage().toLowerCase();
 	if (l.startsWith("zh-tw") || l.startsWith("zh-hant") || l === "zh-hk") return "zh-TW";
 	if (l.startsWith("zh")) return "zh";
 	if (l.startsWith("it")) return "it";
@@ -1149,7 +1146,9 @@ class EpubSettingTab extends PluginSettingTab {
 			.addText((t) => {
 				t.setPlaceholder(DEFAULT_STORAGE.folder);
 				t.setValue(this.plugin.storagePrefs.folder);
-				t.inputEl.onblur = () => this.moveAnnotations(t.getValue().trim() || DEFAULT_STORAGE.folder, () => t.setValue(this.plugin.storagePrefs.folder));
+				t.inputEl.onblur = () => {
+					this.moveAnnotations(t.getValue().trim() || DEFAULT_STORAGE.folder, () => t.setValue(this.plugin.storagePrefs.folder));
+				};
 			})
 			.addExtraButton((b) =>
 				b
@@ -1408,7 +1407,7 @@ class NoteModal extends Modal {
 		const btnRow = contentEl.createDiv({ attr: { style: "margin-top: 8px; text-align: right;" } });
 		const saveBtn = btnRow.createEl("button", { text: tr("保存", "Save", "儲存", "Salva") });
 		saveBtn.onclick = () => {
-			this.onSubmit(textarea.value);
+			void this.onSubmit(textarea.value);
 			this.close();
 		};
 	}
@@ -2329,7 +2328,7 @@ class FolderPickerModal extends Modal {
 				const row = list.createDiv({ cls: "epub-menu-item" });
 				row.createSpan({ text: f || tr("（库根目录）", "(vault root)", "（庫根目錄）", "(radice della cassaforte)") });
 				row.onclick = () => {
-					this.onPick(f);
+					void this.onPick(f);
 					this.close();
 				};
 			}
