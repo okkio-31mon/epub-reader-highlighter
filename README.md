@@ -10,8 +10,9 @@ Read EPUB books directly inside Obsidian, mark them up with color-coded highligh
 - **Scroll or paginated mode** — switch between continuous scrolling and page-by-page reading; turn pages with the on-screen buttons or the ← / → arrow keys.
 - **Fixed page numbers (Apple Books style)** — the whole book is pre-paginated in the background at your current window size and font, so the total page count stays fixed while you read and every page turn advances by exactly 1. "Calculating" shows briefly on first open; the result is cached and only recomputed when the window or font changes. Type a number in the page box to jump straight to that page; scroll mode shows a reading-progress percent instead.
 - **Reading position remembered** — close the book (or quit Obsidian) and reopening returns you to the passage where you left off.
-- **Color-coded highlights** — select text and pick a color from the popup, or press **`Cmd/Ctrl+Shift+H`** to highlight with the default color; the default color is remembered across sessions.
+- **Color-coded highlights** — select text and pick a color from the popup, or press **`Cmd/Ctrl+Shift+H`** to highlight with the default color (the combination is configurable); the default color is remembered across sessions.
 - **Notes on highlights** — attach a comment to any highlight.
+- **Highlights that join up** — highlighting text that runs up against an existing highlight merges the two into one; anything but whitespace or punctuation between them keeps them apart.
 - **Highlight menu** — click a highlight to recolor it (presets, the colors this book already uses, or the wheel), write a note, copy it, or delete it, right where it sits.
 - **Annotations stored in your vault** — each book's highlights are one file in a folder you choose, so any sync tool carries them and editing one book transfers only that file.
 - **Highlights panel** — view every highlight in the current book with its page number, text, and note; jump back to the original location, edit notes, or delete.
@@ -21,9 +22,11 @@ Read EPUB books directly inside Obsidian, mark them up with color-coded highligh
 - **Full-book search** — find a keyword anywhere in the book and jump to any result.
 - **Cross-page highlighting** — mark a start point, turn as many pages as you like, then finish from a later selection to highlight the whole passage in one go (within a chapter).
 - **Recently used colors** — custom colors you have picked stay one click away, and drop off the list once no highlight uses them.
+- **Export the book's text** — export the whole book as one note, or the chapters you choose as separate notes with an index of links. Passages you highlighted can optionally be marked with `==`.
 - **Markdown export** — export all highlights, or just the ones you pick, with control over the folder, grouping, sort order and which details each highlight carries. Every export is a new file stamped with the date and time, so nothing is ever overwritten.
 - **Merge exported notes** — fold several exports of the same book into a single note: duplicates are removed and everything you wrote yourself is preserved. The originals are never modified.
 - **Custom export template** — decide how each highlight is written with `{{text}}`, `{{note}}`, `{{page}}`, `{{chapter}}` and friends, including a conditional block that only appears when a note exists.
+- **Configurable highlight shortcut** — `Cmd/Ctrl+Shift+H` by default, changeable to any combination in the plugin settings.
 - **First-run guide** — a one-time popup explains the toolbar icons; the same reference lives in the plugin's settings tab.
 
 ## Where annotations are stored
@@ -66,13 +69,15 @@ Search for "EPUB Reader and Highlighter" in **Settings → Community plugins →
 | ✎✓ (pencil, check) | **Cross-page highlight · finish** — highlight everything between the marked start and the current selection. |
 | ⋯ | **More** — interface language and the quick guide. |
 
-Shortcuts: `Cmd/Ctrl+Shift+H` highlight the selection · `Cmd/Ctrl+Z` undo.
+Clicking an existing highlight opens an action bar: change its color, write a note, copy it, or delete it.
 
-Highlights, reading positions, and preferences are stored in this plugin's `data.json` inside your vault and never leave your machine.
+Shortcuts: `Cmd/Ctrl+Shift+H` highlight the selection (configurable in the plugin settings) · `Cmd/Ctrl+Z` undo.
+
+Highlights live in your vault as one file per book (see [Where annotations are stored](#where-annotations-are-stored)); reading positions and preferences sit in the plugin's own data file. Nothing leaves your machine.
 
 ## Exporting and merging
 
-Open the highlights menu and choose **Export selected…**. The top row of the dialog picks *which* highlights to export — "All", "Today", "Select chapter", and one chip per color the book uses (your chip choice is remembered per book). The bottom row covers *this* export: sort order, target folder, and a "Set as default" box that writes them back to the settings.
+Open the highlights menu and choose **Choose highlights to export…**. The top row of the dialog picks *which* highlights to export — "All", "Today", "Select chapter", and one chip per color the book uses (your chip choice is remembered per book). The bottom row covers *this* export: sort order, target folder, and a "Set as default" box that writes them back to the settings.
 
 **Export to Markdown** in the same menu skips the dialog and exports everything.
 
@@ -80,7 +85,30 @@ The plugin's settings hold the defaults: export folder, grouping (none / by chap
 
 Turning on **Use a custom template** replaces those toggles with a box where you decide the shape of each entry: `{{index}}`, `{{text}}`, `{{note}}`, `{{page}}`, `{{chapter}}`, `{{book}}`, `{{date}}`, `{{time}}`, `{{color}}`. Anything between `{{#note}}` and `{{/note}}` is written only when a note exists, so entries without one leave no empty label behind. Group headings and the separator between entries stay with the plugin — merging relies on them.
 
+Everything produced from one book — its highlights, a merge of them, and its text — is filed in a folder named after the book, inside your export folder:
+
+```
+<export folder>/
+└── <book name>/
+    ├── Highlights 2026-08-27-1430.md
+    ├── Text 2026-08-27-1629.md
+    └── Selected chapters 2026-08-27-1640/
+        ├── Index.md
+        └── Chapter 1….md
+```
+
 Because every export is its own timestamped file, a book read over several sittings leaves several notes. **Merge exported highlight notes** (command palette, or the button in the settings) folds any of them into one: choose the notes, the grouping and the sort order, preview the result, and it is written to a new file. Duplicate highlights are kept once; anything that matches no highlight — your own writing, or a quote you edited — is preserved under "Other content". The source notes are never touched.
+
+## Exporting the book's text
+
+The highlights menu also carries **Export book text…**. Pick either layout:
+
+- **One note for the whole book** — chapters become `##` headings in a single file.
+- **One note per chapter** — each chapter is its own note, with an index note linking to them in reading order.
+
+Tick the chapters you want; a book's own front matter (cover, copyright page, its printed contents page) is listed too and is usually worth leaving out. Images are skipped and internal links keep only their text.
+
+**Mark highlighted passages** wraps everything you highlighted in `==`, so the archive shows what you marked while reading. Colors aren't carried over — those stay in the highlight export. A notice reports how many passages were matched; a highlight whose wording no longer matches the converted text is skipped rather than silently dropped.
 
 ## Development
 

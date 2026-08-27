@@ -10,8 +10,9 @@ Leggi i libri EPUB direttamente dentro Obsidian, annotali con evidenziazioni col
 - **Modalità scorrimento o pagine** — passa dalla lettura a scorrimento continuo a quella pagina per pagina; volta pagina con i pulsanti a schermo o con le frecce ← / →.
 - **Numeri di pagina fissi (stile Apple Books)** — l'intero libro viene impaginato in background alla dimensione della finestra e al carattere attuali, quindi il totale delle pagine resta fisso durante la lettura e ogni voltata di pagina avanza esattamente di 1. Alla prima apertura appare brevemente «Calcolo»; il risultato viene messo in cache e ricalcolato solo quando cambiano finestra o carattere. Digita un numero nella casella per saltare direttamente a quella pagina; in modalità scorrimento viene mostrata invece la percentuale di lettura.
 - **Posizione di lettura memorizzata** — chiudi il libro (o Obsidian) e alla riapertura torni al passaggio dove avevi lasciato.
-- **Evidenziazioni colorate** — seleziona il testo e scegli un colore dal popup, oppure premi **`Cmd/Ctrl+Shift+H`** per evidenziare con il colore predefinito; il colore predefinito viene ricordato tra le sessioni.
+- **Evidenziazioni colorate** — seleziona il testo e scegli un colore dal popup, oppure premi **`Cmd/Ctrl+Shift+H`** per evidenziare con il colore predefinito (la combinazione è configurabile); il colore predefinito viene ricordato tra le sessioni.
 - **Note sulle evidenziazioni** — aggiungi un commento a qualsiasi evidenziazione.
+- **Evidenziazioni che si uniscono** — evidenziare un testo attaccato a un'evidenziazione esistente fonde le due in una sola; qualsiasi cosa oltre a spazi e punteggiatura tra loro le tiene distinte.
 - **Menu dell'evidenziazione** — fai clic su un'evidenziazione per cambiarne il colore (predefiniti, i colori già usati nel libro o la ruota), scrivere una nota, copiarla o eliminarla sul posto.
 - **Annotazioni nella cassaforte** — le evidenziazioni di ogni libro stanno in un file dentro una cartella che scegli tu, così qualsiasi sincronizzazione le porta con sé e modificare un libro trasferisce solo quel file.
 - **Pannello evidenziazioni** — vedi ogni evidenziazione del libro con numero di pagina, testo e nota; torna al punto originale, modifica le note o elimina.
@@ -21,6 +22,8 @@ Leggi i libri EPUB direttamente dentro Obsidian, annotali con evidenziazioni col
 - **Ricerca in tutto il libro** — cerca una parola in tutto il libro e salta a qualsiasi risultato.
 - **Evidenziazione multi-pagina** — segna un punto d'inizio, gira quante pagine vuoi e concludi da una selezione successiva per evidenziare l'intero passaggio in una volta (all'interno di un capitolo).
 - **Colori usati di recente** — i colori personalizzati restano a portata di clic e spariscono dall'elenco quando nessuna evidenziazione li usa più.
+- **Esportazione del testo del libro** — esporta tutto il libro in una nota, o i capitoli scelti in note separate con un indice di collegamenti. I passaggi evidenziati possono essere segnati con `==`.
+- **Scorciatoia di evidenziazione configurabile** — `Cmd/Ctrl+Shift+H` per impostazione predefinita, modificabile in qualsiasi combinazione nelle impostazioni del plugin.
 - **Esportazione Markdown** — esporta tutte le evidenziazioni o solo quelle che scegli, decidendo cartella, raggruppamento, ordinamento e quali dettagli accompagnano ogni evidenziazione. Ogni esportazione crea un nuovo file con data e ora: nulla viene mai sovrascritto.
 - **Unione delle note esportate** — fonde più esportazioni dello stesso libro in una sola: i duplicati vengono rimossi e ciò che hai scritto resta intatto. Gli originali non vengono modificati.
 - **Modello di esportazione personalizzato** — decidi come viene scritta ogni evidenziazione con `{{text}}`, `{{note}}`, `{{page}}`, `{{chapter}}` e altre variabili, con un blocco condizionale che compare solo se esiste una nota.
@@ -66,13 +69,15 @@ Cerca "EPUB Reader and Highlighter" in **Impostazioni → Plugin della community
 | ✎✓ (matita con spunta) | **Evidenziazione multi-pagina · fine** — evidenzia tutto tra l'inizio segnato e la selezione attuale. |
 | ⋯ | **Altro** — lingua dell'interfaccia e guida rapida. |
 
-Scorciatoie: `Cmd/Ctrl+Shift+H` evidenzia la selezione · `Cmd/Ctrl+Z` annulla.
+Fare clic su un'evidenziazione esistente apre una barra: cambia colore, scrivi una nota, copia, elimina.
 
-Evidenziazioni, posizioni di lettura e preferenze sono salvate nel `data.json` di questo plugin dentro il tuo vault e non lasciano mai il tuo dispositivo.
+Scorciatoie: `Cmd/Ctrl+Shift+H` evidenzia la selezione (configurabile nelle impostazioni) · `Cmd/Ctrl+Z` annulla.
+
+Le evidenziazioni vivono nel vault come un file per libro (vedi [Dove sono conservate le annotazioni](#dove-sono-conservate-le-annotazioni)); posizioni di lettura e preferenze stanno nel file dati del plugin. Nulla lascia il tuo dispositivo.
 
 ## Esportare e unire
 
-Dal menu evidenziazioni scegli **Esporta selezionate…**. La riga in alto della finestra sceglie *quali* evidenziazioni esportare: «Tutte», «Oggi», «Seleziona capitolo» e un pallino per ogni colore usato dal libro (la scelta dei pallini viene ricordata per ogni libro). La riga in basso riguarda *questa* esportazione: ordinamento, cartella di destinazione e la casella «Imposta come predefinito», che li riscrive nelle impostazioni.
+Dal menu evidenziazioni scegli **Scegli le evidenziazioni da esportare…**. La riga in alto della finestra sceglie *quali* evidenziazioni esportare: «Tutte», «Oggi», «Seleziona capitolo» e un pallino per ogni colore usato dal libro (la scelta dei pallini viene ricordata per ogni libro). La riga in basso riguarda *questa* esportazione: ordinamento, cartella di destinazione e la casella «Imposta come predefinito», che li riscrive nelle impostazioni.
 
 **Esporta in Markdown**, nello stesso menu, salta la finestra ed esporta tutto.
 
@@ -81,6 +86,29 @@ Le impostazioni dell'estensione contengono i valori predefiniti: cartella di esp
 Attivando **Usa un modello personalizzato** quegli interruttori lasciano il posto a un riquadro in cui decidi la forma di ogni voce: `{{index}}`, `{{text}}`, `{{note}}`, `{{page}}`, `{{chapter}}`, `{{book}}`, `{{date}}`, `{{time}}`, `{{color}}`. Ciò che sta tra `{{#note}}` e `{{/note}}` viene scritto solo se la nota esiste, così le voci senza nota non lasciano etichette vuote. I titoli dei gruppi e il separatore restano all'estensione: l'unione si basa su di essi.
 
 Poiché ogni esportazione è un file a sé con data e ora, un libro letto in più sessioni lascia più note. **Unisci le note di evidenziazioni esportate** (tavolozza dei comandi o pulsante nelle impostazioni) ne fonde quante ne vuoi in una sola: scegli le note, il raggruppamento e l'ordinamento, guarda l'anteprima e il risultato viene scritto in un nuovo file. Le evidenziazioni ripetute restano una volta sola; ciò che non corrisponde a nessuna evidenziazione — quello che hai scritto tu o una citazione che hai modificato — resta sotto «Altri contenuti». Le note di partenza non vengono mai toccate.
+
+Tutto ciò che nasce da un libro — le evidenziazioni, una loro unione e il testo — è archiviato in una cartella che porta il nome del libro, dentro la cartella di esportazione:
+
+```
+<cartella di esportazione>/
+└── <nome del libro>/
+    ├── Evidenziazioni 2026-08-27-1430.md
+    ├── Testo 2026-08-27-1629.md
+    └── Capitoli scelti 2026-08-27-1640/
+        ├── Indice.md
+        └── Capitolo 1….md
+```
+
+## Esportare il testo del libro
+
+Il menu evidenziazioni contiene anche **Esporta il testo del libro…**. Scegli una delle due strutture:
+
+- **Una nota per tutto il libro** — i capitoli diventano intestazioni `##` in un unico file.
+- **Una nota per capitolo** — ogni capitolo è una nota, più una nota indice che le collega in ordine di lettura.
+
+Spunta i capitoli che vuoi; le pagine iniziali del libro (copertina, pagina del copyright, il suo sommario stampato) sono elencate anch'esse e di solito conviene escluderle. Le immagini vengono ignorate e i collegamenti interni mantengono solo il testo.
+
+**Segna i passaggi evidenziati** racchiude tra `==` tutto ciò che hai evidenziato. I colori non vengono riportati: restano nell'esportazione delle evidenziazioni. Un avviso indica quanti passaggi sono stati trovati; un'evidenziazione la cui formulazione non corrisponde più al testo convertito viene saltata invece di sparire in silenzio.
 
 ## Sviluppo
 

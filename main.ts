@@ -15,6 +15,8 @@ import {
 	TextAreaComponent,
 	Component,
 	getLanguage,
+	Platform,
+	htmlToMarkdown,
 } from "obsidian";
 import ePub, { Book, Rendition, Contents, EpubCFI } from "epubjs";
 
@@ -37,6 +39,8 @@ interface EpubThemesExtra {
 interface EpubSectionLike {
 	href: string;
 	linear?: string;
+	// Set by load(): the parsed chapter document, the source for a text export.
+	document?: Document;
 	load(request: unknown): Promise<unknown>;
 	find(query: string): { cfi: string; excerpt: string }[];
 	unload(): void;
@@ -108,6 +112,38 @@ interface BookRecord {
 	lastCfi?: string;
 }
 
+// A shortcut in canonical form: modifiers in a fixed order, then the key.
+// "Mod" is Cmd on macOS and Ctrl elsewhere, the same notation Obsidian uses.
+const DEFAULT_HIGHLIGHT_HOTKEY = "Mod+Shift+H";
+const MODIFIER_KEYS = ["Control", "Meta", "Alt", "Shift", "AltGraph", "CapsLock"];
+
+function hotkeyString(e: KeyboardEvent): string {
+	if (MODIFIER_KEYS.includes(e.key)) return "";
+	const parts: string[] = [];
+	if (Platform.isMacOS ? e.metaKey : e.ctrlKey) parts.push("Mod");
+	if (Platform.isMacOS ? e.ctrlKey : e.metaKey) parts.push(Platform.isMacOS ? "Ctrl" : "Meta");
+	if (e.altKey) parts.push("Alt");
+	if (e.shiftKey) parts.push("Shift");
+	parts.push(e.key.length === 1 ? e.key.toUpperCase() : e.key);
+	return parts.join("+");
+}
+
+// What the setting shows: the platform's own symbols, so it reads like the rest
+// of the system rather than like a config value.
+function hotkeyLabel(combo: string): string {
+	return combo
+		.split("+")
+		.map((part) => {
+			if (part === "Mod") return Platform.isMacOS ? "\u2318" : "Ctrl";
+			if (part === "Meta") return "\u229e";
+			if (part === "Ctrl") return Platform.isMacOS ? "\u2303" : "Ctrl";
+			if (part === "Alt") return Platform.isMacOS ? "\u2325" : "Alt";
+			if (part === "Shift") return Platform.isMacOS ? "\u21e7" : "Shift";
+			return part;
+		})
+		.join(Platform.isMacOS ? "" : "+");
+}
+
 // Global reading preferences, remembered across books and sessions.
 interface ReadingPrefs {
 	language: string;
@@ -120,6 +156,12 @@ interface ReadingPrefs {
 	highlightColor: string;
 	// Recently used custom highlight colors (hex, newest first, max 5).
 	customHlHistory?: string[];
+	// Shortcut that highlights the selection from inside the book, in the
+	// canonical form built by hotkeyString(). Obsidian's own hotkey dispatch
+	// never receives key events from inside the book's iframe, so a binding made
+	// in its settings can't reach the reader — this one is matched by the
+	// plugin's own key handler instead.
+	highlightHotkey?: string;
 }
 
 // How highlights are written out. Kept apart from ReadingPrefs because these
@@ -578,6 +620,17 @@ export default class EpubReaderPlugin extends Plugin {
 			callback: () => new MergeExportsModal(this.app, this).open(),
 		});
 		this.addCommand({
+			id: "export-book-text",
+			name: tr("导出全书正文为 Markdown", "Export book text to Markdown", "匯出全書正文為 Markdown", "Esporta il testo del libro in Markdown"),
+			checkCallback: (checking) => {
+				const view = this.app.workspace.getActiveViewOfType(EpubView);
+				if (!view) return false;
+				if (checking) return true;
+				new BookTextExportModal(this.app, view).open();
+				return true;
+			},
+		});
+		this.addCommand({
 			id: "highlight-selection",
 			name: tr("高亮选中文字", "Highlight selection", "高亮選取文字", "Evidenzia la selezione"),
 			// No default hotkey: the reader handles Cmd/Ctrl+Shift+H directly inside
@@ -1021,15 +1074,29 @@ export default class EpubReaderPlugin extends Plugin {
 			return;
 		}
 		const bookName = path.split("/").pop()?.replace(/\.epub$/i, "") ?? "epub";
-		const folder = await this.ensureExportFolder(folderOverride);
+		const base = await this.ensureExportFolder(folderOverride);
+		if (base === null) return;
+		const folder = await this.ensureBookFolder(base, bookName);
 		if (folder === null) return;
-		const name = tr(
-			`${bookName} - 高亮摘录`,
-			`${bookName} - Highlights`,
-			`${bookName} - 高亮摘錄`,
-			`${bookName} - Evidenziazioni`
-		);
+		// The folder already says which book this is.
+		const name = tr("高亮摘录", "Highlights", "高亮摘錄", "Evidenziazioni");
 		await this.writeStampedNote(name, markdown, folder);
+	}
+
+	// Everything produced from one book — its highlights, a merge of them, its
+	// text — lands in one folder named after the book, so the export folder holds
+	// a shelf of books rather than a flat pile of stamped files.
+	async ensureBookFolder(base: string, bookName: string): Promise<string | null> {
+		const dir = normalizePath(base ? `${base}/${safeFileName(bookName)}` : safeFileName(bookName));
+		if (!(this.app.vault.getAbstractFileByPath(dir) instanceof TFolder)) {
+			try {
+				await this.app.vault.createFolder(dir);
+			} catch {
+				new Notice(tr(`无法创建文件夹「${dir}」`, `Could not create folder "${dir}"`, `無法建立資料夾「${dir}」`, `Impossibile creare la cartella "${dir}"`));
+				return null;
+			}
+		}
+		return dir;
 	}
 
 	// Resolve the export folder, creating it when missing. null = it can't be made.
@@ -1049,10 +1116,7 @@ export default class EpubReaderPlugin extends Plugin {
 	// Every export and every merge lands in its own file, stamped to the minute,
 	// so nothing existing is ever overwritten.
 	async writeStampedNote(name: string, markdown: string, folder: string) {
-		const d = new Date();
-		const pad = (n: number) => `${n}`.padStart(2, "0");
-		const stamp = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
-		const stem = `${name} ${stamp}`.replace(/[\\/:*?"<>|]/g, "-");
+		const stem = `${name} ${timeStamp()}`.replace(/[\\/:*?"<>|]/g, "-");
 		const dir = folder ? `${folder}/` : "";
 		let outPath = normalizePath(`${dir}${stem}.md`);
 		for (let n = 2; this.app.vault.getAbstractFileByPath(outPath); n++) {
@@ -1067,10 +1131,18 @@ export default class EpubReaderPlugin extends Plugin {
 
 class EpubSettingTab extends PluginSettingTab {
 	plugin: EpubReaderPlugin;
+	// Removes the in-progress shortcut listener; a no-op when none is running.
+	private stopCapture: () => void = () => undefined;
 
 	constructor(app: App, plugin: EpubReaderPlugin) {
 		super(app, plugin);
 		this.plugin = plugin;
+	}
+
+	hide() {
+		// Leaving the tab mid-capture must not leave a document listener behind.
+		this.stopCapture();
+		super.hide();
 	}
 
 	// Changing the folder moves every annotation file, so it asks first and says
@@ -1129,6 +1201,58 @@ class EpubSettingTab extends PluginSettingTab {
 					this.display();
 				});
 			});
+
+		new Setting(containerEl)
+			.setName(tr("高亮快捷键", "Highlight shortcut", "高亮快捷鍵", "Scorciatoia di evidenziazione"))
+			.setDesc(
+				tr(
+					"在书页内按下即可高亮选中的文字。Obsidian 的快捷键设置收不到书页内的按键，所以这里单独设置。点击右侧按钮后按下想要的组合，Esc 取消。",
+					"Highlights the selected text from inside the book. Obsidian's own hotkey settings never receive key presses from inside the book, so this one is set here. Click the button, then press the combination you want; Esc cancels.",
+					"在書頁內按下即可高亮選取的文字。Obsidian 的快捷鍵設定收不到書頁內的按鍵，所以這裡單獨設定。點擊右側按鈕後按下想要的組合，Esc 取消。",
+					"Evidenzia il testo selezionato dall'interno del libro. Le impostazioni delle scorciatoie di Obsidian non ricevono i tasti premuti dentro il libro, quindi questa si imposta qui. Fai clic sul pulsante e premi la combinazione desiderata; Esc annulla."
+				)
+			)
+			.addButton((btn) => {
+				const show = () => btn.setButtonText(hotkeyLabel(this.plugin.data.prefs.highlightHotkey || DEFAULT_HIGHLIGHT_HOTKEY));
+				show();
+				btn.onClick(() => {
+					this.stopCapture();
+					btn.setButtonText(tr("按下快捷键…", "Press a shortcut…", "按下快捷鍵…", "Premi una combinazione…"));
+					const doc = containerEl.ownerDocument;
+					const capture = (e: KeyboardEvent) => {
+						e.preventDefault();
+						e.stopPropagation();
+						if (e.key === "Escape") {
+							this.stopCapture();
+							show();
+							return;
+						}
+						// Modifier keys on their own aren't a shortcut; keep listening.
+						const combo = hotkeyString(e);
+						if (!combo) return;
+						this.plugin.data.prefs.highlightHotkey = combo;
+						void this.plugin.saveBookData();
+						this.stopCapture();
+						show();
+					};
+					doc.addEventListener("keydown", capture, true);
+					this.stopCapture = () => {
+						doc.removeEventListener("keydown", capture, true);
+						this.stopCapture = () => undefined;
+					};
+				});
+			})
+			.addExtraButton((b) =>
+				b
+					.setIcon("rotate-ccw")
+					.setTooltip(tr("恢复默认", "Reset to default", "恢復預設", "Ripristina"))
+					.onClick(async () => {
+						this.stopCapture();
+						this.plugin.data.prefs.highlightHotkey = DEFAULT_HIGHLIGHT_HOTKEY;
+						await this.plugin.saveBookData();
+						this.display();
+					})
+			);
 
 		// ---- Storage ----
 		new Setting(containerEl).setName(tr("批注存储", "Annotation storage", "批註儲存", "Archiviazione")).setHeading();
@@ -1389,17 +1513,34 @@ class EpubSettingTab extends PluginSettingTab {
 
 class NoteModal extends Modal {
 	private result: string;
+	private quote: string;
 	private onSubmit: (note: string) => void | Promise<void>;
 
-	constructor(app: App, initial: string, onSubmit: (note: string) => void | Promise<void>) {
+	constructor(app: App, initial: string, quote: string, onSubmit: (note: string) => void | Promise<void>) {
 		super(app);
 		this.result = initial;
+		this.quote = quote;
 		this.onSubmit = onSubmit;
 	}
 
 	onOpen() {
 		const { contentEl } = this;
 		contentEl.createEl("h3", { text: tr("添加笔记", "Add note", "新增筆記", "Aggiungi nota") });
+		// The passage the note belongs to. Several highlights can be open in a
+		// session and their text is often near-identical, so writing a note without
+		// seeing which one it lands on is guesswork.
+		if (this.quote) {
+			contentEl.createDiv({
+				text: this.quote,
+				attr: {
+					style:
+						"max-height: 20vh; overflow: auto; margin-bottom: 10px; padding: 8px 10px;" +
+						" border-left: 3px solid var(--text-accent); background: var(--background-secondary);" +
+						" border-radius: 4px; color: var(--text-muted); font-size: var(--font-ui-small);" +
+						" white-space: pre-wrap;",
+				},
+			});
+		}
 		const textarea = contentEl.createEl("textarea", {
 			attr: { rows: "5", style: "width: 100%;" },
 		});
@@ -1440,10 +1581,18 @@ class HighlightListModal extends Modal {
 		const header = contentEl.createDiv({
 			attr: { style: "display: flex; align-items: center; justify-content: space-between; gap: 8px;" },
 		});
-		header.createEl("h3", { text: tr("所有高亮", "All highlights", "所有高亮", "Tutte le evidenziazioni"), attr: { style: "margin: 0;" } });
+		const titleEl = header.createEl("h3", { text: tr("所有高亮", "All highlights", "所有高亮", "Tutte le evidenziazioni"), attr: { style: "margin: 0;" } });
 
 		const record = this.view.plugin.getBookRecord(this.view.filePath);
 		const sorted = [...record.highlights].sort((a, b) => a.created - b.created);
+		// How many there are, in the heading — the list scrolls, so counting the
+		// rows isn't an option. Same size and weight as the title, only dimmed, so
+		// it reads as part of the heading rather than a label stuck onto it.
+		if (sorted.length > 0) {
+			// Inherits the heading's own color — whatever the theme paints it — and is
+			// only faded, so the two always match.
+			titleEl.createSpan({ text: ` · ${sorted.length}`, attr: { style: "opacity: 0.45;" } });
+		}
 
 		if (sorted.length === 0) {
 			contentEl.createEl("p", { text: tr("还没有任何高亮。", "No highlights yet.", "還沒有任何高亮。", "Ancora nessuna evidenziazione."), attr: { style: "color: var(--text-muted);" } });
@@ -1501,7 +1650,7 @@ class HighlightListModal extends Modal {
 			});
 			setIcon(noteBtn, h.note ? "pencil" : "message-square-plus");
 			noteBtn.onclick = () => {
-				new NoteModal(this.app, h.note, async (note) => {
+				new NoteModal(this.app, h.note, h.text, async (note) => {
 					h.note = note;
 					await this.view.plugin.saveBookData();
 					this.render();
@@ -1568,34 +1717,63 @@ function toolbarGuide(): { icon?: string; mark?: string; label: string; desc: st
 				"Dopo aver girato pagina seleziona il testo finale e clicca per evidenziare tutto (nello stesso capitolo)"
 			),
 		},
+		{
+			icon: "pencil-line",
+			label: tr("修改高亮", "Editing a highlight", "修改高亮", "Modificare un'evidenziazione"),
+			desc: tr(
+				"点击已经划线的文字，弹出操作栏：高光颜色更换、添加备注、复制、删除。在已有高亮内容前后标注相连内容，会自动合并成一条",
+				"Click text you have highlighted to open the action bar: change the color, add a note, copy, delete. Highlighting text that runs up against an existing highlight joins the two into one",
+				"點擊已經劃線的文字，彈出操作欄：高光顏色更換、新增備註、複製、刪除。在已有高亮內容前後標註相連內容，會自動合併成一條",
+				"Fai clic su un testo evidenziato per aprire la barra: cambia colore, aggiungi una nota, copia, elimina. Evidenziare un testo attaccato a un'evidenziazione esistente unisce le due in una sola"
+			),
+		},
 		{ icon: "sliders-horizontal", label: tr("阅读设置", "Reading settings", "閱讀設定", "Impostazioni di lettura"), desc: tr("字体、字号、背景色；点色轮展开取色面板自定义颜色", "Font, text size and background; the color wheel expands an inline picker for any custom color", "字型、字級、背景色；點色輪展開取色面板自訂顏色", "Carattere, dimensione e sfondo; la ruota dei colori apre un selettore integrato") },
 		{ label: tr("滚动 / 分页", "Scroll / Paged", "捲動 / 分頁", "Scorri / Pagine"), desc: tr("切换滚动阅读或分页阅读", "Switch between scrolling and paginated reading", "切換捲動或分頁閱讀", "Passa tra lettura a scorrimento o a pagine") },
 		{ label: "‹  ›", desc: tr("上一页 / 下一页，也可用键盘方向键", "Previous / next page — the arrow keys work too", "上一頁 / 下一頁，也可用方向鍵", "Pagina precedente / successiva — anche con le frecce") },
-		{ label: tr("页码", "Pages", "頁碼", "Pagine"), desc: tr("页码按当前窗口和字号预排全书得出：总数固定、翻页只 +1，打开或改字号后短暂显示「计算中」。在页码框输入数字回车可跳页；滚动模式下显示进度百分比", "Page numbers come from pre-paginating the whole book at your window size and font: the total is fixed and each turn advances by exactly 1; “Calculating” shows briefly after opening or changing the font. Type a number in the page box to jump; scroll mode shows a progress percent instead", "頁碼按目前視窗和字級預排全書得出：總數固定、翻頁只 +1，開啟或改字級後短暫顯示「計算中」。在頁碼框輸入數字按 Enter 可跳頁；捲動模式下顯示進度百分比", "I numeri di pagina derivano dall'impaginazione dell'intero libro alla finestra e al carattere attuali: il totale è fisso e ogni pagina avanza di 1; dopo l'apertura o un cambio di carattere appare brevemente «Calcolo». Digita un numero nella casella per saltare a una pagina; in modalità scorrimento mostra la percentuale di lettura") },
+		{ label: tr("页码", "Pages", "頁碼", "Pagine"), desc: tr("页码按当前窗口和字号预排全书得出，打开或改字号后会短暂显示「计算中」。在页码框输入数字回车可跳页；滚动模式下显示进度百分比", "Page numbers come from pre-paginating the whole book at your window size and font; “Calculating” shows briefly after opening or changing the font. Type a number in the page box to jump; scroll mode shows a progress percent instead", "頁碼按目前視窗和字級預排全書得出，開啟或改字級後會短暫顯示「計算中」。在頁碼框輸入數字按 Enter 可跳頁；捲動模式下顯示進度百分比", "I numeri di pagina derivano dall'impaginazione dell'intero libro alla finestra e al carattere attuali; dopo l'apertura o un cambio di carattere appare brevemente «Calcolo». Digita un numero nella casella per saltare a una pagina; in modalità scorrimento mostra la percentuale di lettura") },
 		{
 			icon: "download",
 			label: tr("导出高亮", "Exporting highlights", "匯出高亮", "Esportare le evidenziazioni"),
 			desc: tr(
-				"1. 高亮菜单 →「选择导出…」打开弹窗，上排挑要导出哪些：「全部」「今日」「章节选择」和色点（色点按书记住上次的选择）\n2. 弹窗底部的「排序」和「导出到」只影响这一次；勾「设为默认」才写回设置\n3. 插件设置里的「导出文件夹」「分组方式」「排序方式」和几个字段开关是全局默认值\n4. 高亮菜单 →「导出为 Markdown」不经过弹窗，直接导出全部\n5. 每次导出都是一个新文件，文件名带日期时间，永不覆盖旧文件\n6. 想自己决定每条高亮的排版，打开设置里的「使用自定义模板」，用 {{变量}} 写",
-				"1. Highlights menu → “Export selected…” opens the dialog; the top row picks what to export: “All”, “Today”, “Select chapter” and the color chips (remembered per book)\n2. “Sort” and “Export to” at the bottom of the dialog affect that one export only; “Set as default” writes them back to settings\n3. “Export folder”, “Group by”, “Sort by” and the field toggles in the plugin settings are the global defaults\n4. Highlights menu → “Export to Markdown” skips the dialog and exports everything\n5. Every export is a new file stamped with the date and time; nothing is ever overwritten\n6. To decide the layout of each highlight yourself, turn on “Use a custom template” in the settings and write it with {{variables}}",
-				"1. 高亮選單 →「選擇匯出…」開啟彈窗，上排挑要匯出哪些：「全部」「今日」「章節選擇」和色點（色點按書記住上次的選擇）\n2. 彈窗底部的「排序」和「匯出到」只影響這一次；勾「設為預設」才寫回設定\n3. 外掛設定裡的「匯出資料夾」「分組方式」「排序方式」和幾個欄位開關是全域預設值\n4. 高亮選單 →「匯出為 Markdown」不經過彈窗，直接匯出全部\n5. 每次匯出都是一個新檔案，檔名帶日期時間，永不覆蓋舊檔\n6. 想自己決定每條高亮的排版，打開設定裡的「使用自訂模板」，用 {{變數}} 寫",
-				"1. Menu evidenziazioni → «Esporta selezionate…» apre la finestra; la riga in alto sceglie cosa esportare: «Tutte», «Oggi», «Seleziona capitolo» e i pallini colorati (ricordati per libro)\n2. «Ordina» ed «Esporta in» in fondo alla finestra valgono solo per quella esportazione; «Imposta come predefinito» li riscrive nelle impostazioni\n3. «Cartella di esportazione», «Raggruppa per», «Ordina per» e gli interruttori dei campi nelle impostazioni sono i valori predefiniti globali\n4. Menu evidenziazioni → «Esporta in Markdown» salta la finestra ed esporta tutto\n5. Ogni esportazione crea un nuovo file con data e ora: nulla viene mai sovrascritto\n6. Per decidere tu il layout di ogni evidenziazione, attiva «Usa un modello personalizzato» nelle impostazioni e scrivilo con {{variabili}}"
+				"1. 高亮菜单 →「高光内容选择导出…」打开弹窗。弹窗顶部一行选择范围：「全部」「今日」「章节选择」，以及高亮内容颜色圆点——点击只选该颜色的高亮（每本书记住上次的选择）\n2. 弹窗底部的「排序」和「导出到」是单次设定；勾选「设为默认」设定全局\n3. 插件设置里的「导出文件夹」「分组方式」「排序方式」和字段开关是全局默认值，可打开设置页面单独修改\n4. 高亮菜单 →「导出为 Markdown」不经过弹窗，直接导出全部\n5. 每次导出都是新文件，文件名带日期时间，永不覆盖旧文件\n6. 设置里打开「使用自定义模板」，可自定义每条高亮的格式排版，用 {{变量}} 编写",
+				"1. Highlights menu → “Choose highlights to export…” opens the dialog. The top row picks the range: “All”, “Today”, “Select chapter”, and the highlight color dots — click one to select only that color (remembered per book)\n2. “Sort” and “Export to” at the bottom of the dialog are for that export only; “Set as default” makes them global\n3. “Export folder”, “Group by”, “Sort by” and the field toggles in the plugin settings are the global defaults, and can each be changed there\n4. Highlights menu → “Export to Markdown” skips the dialog and exports everything\n5. Every export is a new file stamped with the date and time; nothing is ever overwritten\n6. Turn on “Use a custom template” in the settings to lay out each highlight yourself, written with {{variables}}",
+				"1. 高亮選單 →「高光內容選擇匯出…」開啟彈窗。彈窗頂部一行選擇範圍：「全部」「今日」「章節選擇」，以及高亮內容顏色圓點——點擊只選該顏色的高亮（每本書記住上次的選擇）\n2. 彈窗底部的「排序」和「匯出到」是單次設定；勾選「設為預設」設定全域\n3. 外掛設定裡的「匯出資料夾」「分組方式」「排序方式」和欄位開關是全域預設值，可打開設定頁面單獨修改\n4. 高亮選單 →「匯出為 Markdown」不經過彈窗，直接匯出全部\n5. 每次匯出都是新檔案，檔名帶日期時間，永不覆蓋舊檔\n6. 設定裡打開「使用自訂模板」，可自訂每條高亮的格式排版，用 {{變數}} 編寫",
+				"1. Menu evidenziazioni → «Scegli le evidenziazioni da esportare…» apre la finestra. La riga in alto sceglie l'ambito: «Tutte», «Oggi», «Seleziona capitolo» e i pallini colorati — un clic seleziona solo quel colore (ricordato per libro)\n2. «Ordina» ed «Esporta in», in fondo alla finestra, valgono solo per quella esportazione; «Imposta come predefinito» li rende globali\n3. «Cartella di esportazione», «Raggruppa per», «Ordina per» e gli interruttori dei campi nelle impostazioni sono i valori predefiniti globali e si modificano lì\n4. Menu evidenziazioni → «Esporta in Markdown» salta la finestra ed esporta tutto\n5. Ogni esportazione crea un nuovo file con data e ora: nulla viene mai sovrascritto\n6. Attiva «Usa un modello personalizzato» nelle impostazioni per definire tu il layout di ogni evidenziazione, con {{variabili}}"
+			),
+		},
+		{
+			icon: "book-text",
+			label: tr("导出正文", "Exporting the book text", "匯出正文", "Esportare il testo"),
+			desc: tr(
+				"1. 高亮菜单 →「导出全书正文…」打开弹窗\n2. 可选导出整本\n3. 可选择章节导出，附索引双链\n4. 可选高亮划线内容用 == 重点标出",
+				"1. Highlights menu → “Export book text…” opens the dialog\n2. Export the whole book as one note\n3. Or export the chapters you choose as separate notes, with an index of links\n4. Optionally mark the passages you highlighted with ==",
+				"1. 高亮選單 →「匯出全書正文…」開啟彈窗\n2. 可選匯出整本\n3. 可選擇章節匯出，附索引雙鏈\n4. 可選高亮劃線內容用 == 重點標出",
+				"1. Menu evidenziazioni → «Esporta il testo del libro…» apre la finestra\n2. Esporta tutto il libro in una nota\n3. Oppure esporta i capitoli scelti in note separate, con un indice di collegamenti\n4. Facoltativo: segna con == i passaggi evidenziati"
 			),
 		},
 		{
 			icon: "git-merge",
 			label: tr("合并摘录", "Merging exports", "合併摘錄", "Unire le esportazioni"),
 			desc: tr(
-				"合并同一本书的多份导出。可选择要合并哪几份、如何分组排序，生成前可预览。重复内容自动去除，其余一律保留。结果写入新文件。",
-				"Merge several exports of the same book. Choose which notes to include and how they are grouped and sorted, and preview the result before it is created. Duplicates are removed, everything else is kept. The result is written to a new file.",
-				"合併同一本書的多份匯出。可選擇要合併哪幾份、如何分組排序，產生前可預覽。重複內容自動去除，其餘一律保留。結果寫入新檔案。",
-				"Unisce più esportazioni dello stesso libro. Scegli quali note includere e come raggrupparle e ordinarle, con anteprima prima della creazione. I duplicati vengono rimossi, tutto il resto viene conservato. Il risultato è scritto in un nuovo file."
+				"1. 合并同一本书的多份导出，结果写入新文件，原文件不动\n2. 可选择合并哪几份，以及如何分组、排序\n3. 生成前可以预览\n4. 重复的内容自动去除，其余一律保留",
+				"1. Merges several exports of the same book into a new file; the originals are untouched\n2. Choose which notes to include, and how they are grouped and sorted\n3. Preview the result before it is created\n4. Duplicates are removed, everything else is kept",
+				"1. 合併同一本書的多份匯出，結果寫入新檔案，原檔案不動\n2. 可選擇合併哪幾份，以及如何分組、排序\n3. 產生前可以預覽\n4. 重複的內容自動去除，其餘一律保留",
+				"1. Unisce più esportazioni dello stesso libro in un nuovo file; gli originali restano intatti\n2. Scegli quali note includere e come raggrupparle e ordinarle\n3. Puoi vedere l'anteprima prima della creazione\n4. I duplicati vengono rimossi, tutto il resto viene conservato"
 			),
 		},
 		{ icon: "search", label: tr("搜索", "Search", "搜尋", "Cerca"), desc: tr("全书搜索关键词，点击结果跳转", "Search the whole book and jump to a result", "全書搜尋關鍵詞，點擊結果跳轉", "Cerca in tutto il libro e salta a un risultato") },
 		{ icon: "more-horizontal", label: tr("更多", "More", "更多", "Altro"), desc: tr("界面语言和使用说明", "Interface language and this quick guide", "介面語言和使用說明", "Lingua dell'interfaccia e questa guida") },
 		{ label: tr("自动保存", "Auto-save", "自動儲存", "Salvataggio"), desc: tr("阅读位置、偏好和高亮都会自动保存，重新打开回到上次读到的地方", "Reading position, preferences and highlights are saved automatically; reopening returns to where you left off", "閱讀位置、偏好和高亮都會自動儲存，重新開啟回到上次讀到的地方", "Posizione di lettura, preferenze ed evidenziazioni si salvano da sole; alla riapertura torni dove avevi lasciato") },
-		{ label: tr("快捷键", "Shortcuts", "快捷鍵", "Scorciatoie"), desc: tr("⌘⇧H 高亮选中文字；⌘Z 撤销高亮", "Cmd/Ctrl+Shift+H highlights the selection; Cmd/Ctrl+Z undoes it", "⌘⇧H 高亮選取文字；⌘Z 復原高亮", "Cmd/Ctrl+Maiusc+H evidenzia la selezione; Cmd/Ctrl+Z annulla") },
+		{
+			label: tr("批注存放", "Where annotations live", "批註存放", "Dove vivono le annotazioni"),
+			desc: tr(
+				"每本书的高亮存成库内一个独立文件，默认在「epub-highlights」文件夹，位置可在设置里改。同步工具只会传输改动过的那本书",
+				"Each book's highlights are one file in your vault, in the “epub-highlights” folder by default; the location can be changed in the settings. Sync tools only carry the book you changed",
+				"每本書的高亮存成庫內一個獨立檔案，預設在「epub-highlights」資料夾，位置可在設定裡改。同步工具只會傳輸改動過的那本書",
+				"Le evidenziazioni di ogni libro sono un file nel tuo vault, per impostazione predefinita nella cartella «epub-highlights»; la posizione si cambia nelle impostazioni. Gli strumenti di sincronizzazione trasferiscono solo il libro modificato"
+			),
+		},
+		{ label: tr("快捷键", "Shortcuts", "快捷鍵", "Scorciatoie"), desc: tr("⌘⇧H 高亮选中文字，可在插件设置里改成任意组合；⌘Z 撤销高亮", "Cmd/Ctrl+Shift+H highlights the selection — the combination can be changed in the plugin settings; Cmd/Ctrl+Z undoes it", "⌘⇧H 高亮選取文字，可在外掛設定裡改成任意組合；⌘Z 復原高亮", "Cmd/Ctrl+Maiusc+H evidenzia la selezione — la combinazione si cambia nelle impostazioni; Cmd/Ctrl+Z annulla") },
 	];
 }
 
@@ -1604,37 +1782,96 @@ function toolbarGuide(): { icon?: string; mark?: string; label: string; desc: st
 // is one button away.
 const RELEASE_NOTES: { version: string; lines: () => string[] }[] = [
 	{
+		version: "0.5.0",
+		lines: () => [
+			tr(
+				"**导出全书正文。**高亮菜单 →「导出全书正文…」。\n可导出整本为一个文件，或按章拆成多个文件并生成索引双链；可勾选要导出的章节；可选把已划线的段落用 == 标出",
+				"**Exporting the book text.** Highlights menu → “Export book text…”.\nExport the whole book as one note, or the chapters you choose as separate notes with an index of links; highlighted passages can optionally be marked with ==",
+				"**匯出全書正文。**高亮選單 →「匯出全書正文…」。\n可匯出整本為一個檔案，或按章拆成多個檔案並產生索引雙鏈；可勾選要匯出的章節；可選把已劃線的段落用 == 標出",
+				"**Esportazione del testo.** Menu evidenziazioni → «Esporta il testo del libro…».\nEsporta tutto il libro in una nota, o i capitoli scelti in note separate con un indice di collegamenti; i passaggi evidenziati possono essere segnati con =="
+			),
+			tr(
+				"**高亮快捷键可自定义。**\n设置里点击按钮后按下想要的组合即可，默认仍是 ⌘⇧H",
+				"**The highlight shortcut is configurable.**\nClick the button in the settings and press the combination you want; the default is still Cmd/Ctrl+Shift+H",
+				"**高亮快捷鍵可自訂。**\n設定裡點擊按鈕後按下想要的組合即可，預設仍是 ⌘⇧H",
+				"**Scorciatoia di evidenziazione configurabile.**\nFai clic sul pulsante nelle impostazioni e premi la combinazione desiderata; il valore predefinito resta Cmd/Ctrl+Maiusc+H"
+			),
+			tr(
+				"**导出文件按书归档。**\n同一本书的高亮摘录、合并摘录、正文，统一存放在以书名命名的文件夹里。此前导出的文件不受影响",
+				"**Exports are filed by book.**\nThe highlights, merged highlights and text of one book all go into a folder named after it. Files exported earlier are untouched",
+				"**匯出檔案按書歸檔。**\n同一本書的高亮摘錄、合併摘錄、正文，統一存放在以書名命名的資料夾裡。此前匯出的檔案不受影響",
+				"**Esportazioni archiviate per libro.**\nEvidenziazioni, unioni e testo di uno stesso libro finiscono in una cartella che porta il suo nome. I file esportati in precedenza restano dove sono"
+			),
+			tr(
+				"**目录点击无法跳转。**\n目录条目与章节文件的路径写法不一致时（相对路径、URL 编码、多余前缀），跳转会静默失败，现已全部可用",
+				"**Clicking a chapter in the contents did nothing.**\nWhen a contents entry and the chapter file spell their paths differently — a relative path, URL encoding, an extra prefix — the jump failed silently. All of them work now",
+				"**目錄點擊無法跳轉。**\n目錄條目與章節檔案的路徑寫法不一致時（相對路徑、URL 編碼、多餘前綴），跳轉會靜默失敗，現已全部可用",
+				"**Il clic su un capitolo del sommario non faceva nulla.**\nQuando la voce del sommario e il file del capitolo scrivono il percorso in modo diverso — percorso relativo, codifica URL, un prefisso in più — il salto falliva in silenzio. Ora funzionano tutti"
+			),
+			tr(
+				"**划线时误触已有高亮。**\n拖选的起点或终点落在已有高亮上时，会弹出修改栏并关掉调色盘，导致无法划线，现已修正",
+				"**Selecting onto an existing highlight blocked the new one.**\nWhen a drag started or ended on a highlight, its action bar opened and dismissed the color popup, so the selection could not be highlighted. Fixed",
+				"**劃線時誤觸已有高亮。**\n拖選的起點或終點落在已有高亮上時，會彈出修改欄並關掉調色盤，導致無法劃線，現已修正",
+				"**Selezionare sopra un'evidenziazione bloccava la nuova.**\nSe il trascinamento iniziava o finiva su un'evidenziazione, si apriva la sua barra e chiudeva la tavolozza, rendendo impossibile evidenziare. Corretto"
+			),
+			tr(
+				"**相邻高亮不再各自独立。**\n相邻高亮内容划线，两条合并为一条；中间有文字符号分隔则仍保持两条",
+				"**Adjacent highlights are no longer separate.**\nHighlighting text that runs up against an existing highlight joins the two into one; anything but whitespace or punctuation between them keeps them apart",
+				"**相鄰高亮不再各自獨立。**\n相鄰高亮內容劃線，兩條合併為一條；中間有文字符號分隔則仍保持兩條",
+				"**Le evidenziazioni adiacenti non restano più separate.**\nEvidenziare un testo attaccato a un'evidenziazione esistente unisce le due in una sola; qualsiasi cosa oltre a spazi e punteggiatura tra loro le tiene distinte"
+			),
+			tr(
+				"**弹窗过早消失。**\n划线弹窗和高亮修改栏不再自行关闭",
+				"**Popups closed too soon.**\nThe color popup and the highlight action bar no longer dismiss themselves",
+				"**彈窗過早消失。**\n劃線彈窗和高亮修改欄不再自行關閉",
+				"**Le finestrelle sparivano troppo presto.**\nLa tavolozza e la barra dell'evidenziazione non si chiudono più da sole"
+			),
+			tr(
+				"**自定义颜色无法直接使用。**\n用过的自定义色现在各占一个色块，点击即用；取色盘移到最后单独一个按钮",
+				"**Custom colors could not be reused directly.**\nEach custom color already in use now has its own swatch that applies on a click; the picker moved to a button of its own at the end",
+				"**自訂顏色無法直接使用。**\n用過的自訂色現在各佔一個色塊，點擊即用；取色盤移到最後單獨一個按鈕",
+				"**I colori personalizzati non si potevano riusare.**\nOgni colore già usato ha ora un proprio campione che si applica con un clic; il selettore è passato a un pulsante a parte, in fondo"
+			),
+			tr(
+				"**其他。**\n添加笔记时显示对应的高亮原文；「所有高亮」标题显示条数；滚动模式下不再对图片设高度上限",
+				"**Other.**\nThe note editor shows the passage the note belongs to; the “All highlights” heading shows how many there are; images are no longer capped in height in scroll mode",
+				"**其他。**\n新增筆記時顯示對應的高亮原文；「所有高亮」標題顯示條數；捲動模式下不再對圖片設高度上限",
+				"**Altro.**\nL'editor delle note mostra il passaggio a cui appartiene la nota; l'intestazione «Tutte le evidenziazioni» indica quante sono; in modalità scorrimento le immagini non hanno più un'altezza massima"
+			),
+		],
+	},
+	{
 		version: "0.4.0",
 		lines: () => [
 			tr(
-				"批注改为每本书一个文件，存放在库内的「epub-highlights」文件夹，位置可在设置中修改；任何更改都会同步变动",
-				"Annotations are stored as one file per book in the vault's “epub-highlights” folder, configurable in the settings; changes sync along with the rest of the vault",
-				"批註改為每本書一個檔案，存放在庫內的「epub-highlights」資料夾，位置可在設定中修改；任何更改都會同步變動",
-				"Le annotazioni sono un file per libro nella cartella «epub-highlights», configurabile nelle impostazioni; le modifiche si sincronizzano con il resto della cassaforte"
+				"**批注存放在库内。**\n每本书一个文件，放在「epub-highlights」文件夹，位置可在设置中修改；任何更改都会随库同步",
+				"**Annotations live in the vault.**\nOne file per book, in the “epub-highlights” folder and configurable in the settings; changes sync along with the rest of the vault",
+				"**批註存放在庫內。**\n每本書一個檔案，放在「epub-highlights」資料夾，位置可在設定中修改；任何更改都會隨庫同步",
+				"**Le annotazioni vivono nel vault.**\nUn file per libro, nella cartella «epub-highlights» e configurabile nelle impostazioni; le modifiche si sincronizzano con il resto"
 			),
 			tr(
-				"高亮定位失效时会按原文重新找回并自动修复，换机器或删除相邻高亮不再导致高亮消失",
-				"A highlight whose anchor no longer lands on its passage is found again by its text and repaired, so it no longer disappears after switching machines or deleting a neighbouring highlight",
-				"高亮定位失效時會按原文重新找回並自動修復，換機器或刪除相鄰高亮不再導致高亮消失",
-				"Un'evidenziazione la cui ancora non trova più il passaggio viene ritrovata dal testo e riparata: non sparisce più cambiando macchina o eliminando quella accanto"
+				"**高亮定位自动修复。**\n定位失效时会按原文重新找回，换机器或删除相邻高亮不再导致高亮消失",
+				"**Highlight anchors repair themselves.**\nAn anchor that no longer lands on its passage is found again by its text, so highlights no longer disappear after switching machines or deleting a neighbour",
+				"**高亮定位自動修復。**\n定位失效時會按原文重新找回，換機器或刪除相鄰高亮不再導致高亮消失",
+				"**Le ancore si riparano da sole.**\nUn'ancora che non trova più il suo passaggio viene ritrovata dal testo: le evidenziazioni non spariscono più cambiando macchina o eliminando quella accanto"
 			),
 			tr(
-				"在已有高亮上重新划线时合并为一条，采用新的范围和颜色",
-				"Highlighting over existing highlights folds them into one, with the new extent and color",
-				"在已有高亮上重新劃線時合併為一條，採用新的範圍和顏色",
-				"Evidenziare sopra evidenziazioni esistenti le unisce in una, con la nuova estensione e il nuovo colore"
+				"**重叠高亮合并为一条。**\n在已有高亮上重新划线时合并为一条，采用新的范围和颜色",
+				"**Overlapping highlights fold into one.**\nHighlighting over an existing highlight merges them, with the new extent and color",
+				"**重疊高亮合併為一條。**\n在已有高亮上重新劃線時合併為一條，採用新的範圍和顏色",
+				"**Le evidenziazioni sovrapposte si uniscono.**\nEvidenziare sopra una esistente le fonde, con la nuova estensione e il nuovo colore"
 			),
 			tr(
-				"文件被更换时会被识别，原有批注保留在标记为旧版的文件中",
-				"A replaced book file is recognised, and the earlier annotations are kept in a file marked as previous",
-				"檔案被更換時會被識別，原有批註保留在標記為舊版的檔案中",
-				"La sostituzione del file di un libro viene riconosciuta e le annotazioni precedenti restano in un file contrassegnato come precedente"
+				"**更换书籍文件可识别。**\n文件被更换时会被识别，原有批注保留在标记为旧版的文件中",
+				"**A replaced book is recognised.**\nWhen the file is swapped, the earlier annotations are kept in a file marked as previous",
+				"**更換書籍檔案可識別。**\n檔案被更換時會被識別，原有批註保留在標記為舊版的檔案中",
+				"**Un libro sostituito viene riconosciuto.**\nSe il file cambia, le annotazioni precedenti restano in un file contrassegnato come precedente"
 			),
 			tr(
-				"分页缓存改为本机存储，不再随库同步，插件数据文件体积大幅下降",
-				"The pagination cache is kept on the device rather than in the vault, cutting the plugin's data file down sharply",
-				"分頁快取改為本機儲存，不再隨庫同步，外掛資料檔案體積大幅下降",
-				"La cache di impaginazione resta sul dispositivo, riducendo molto il file dati dell'estensione"
+				"**分页缓存改为本机存储。**\n不再随库同步，插件数据文件体积大幅下降",
+				"**The pagination cache stays on the device.**\nIt is no longer synced with the vault, cutting the plugin's data file down sharply",
+				"**分頁快取改為本機儲存。**\n不再隨庫同步，外掛資料檔案體積大幅下降",
+				"**La cache di impaginazione resta sul dispositivo.**\nNon viene più sincronizzata e il file dati dell'estensione si riduce molto"
 			),
 		],
 	},
@@ -1642,22 +1879,22 @@ const RELEASE_NOTES: { version: string; lines: () => string[] }[] = [
 		version: "0.3.2",
 		lines: () => [
 			tr(
-				"修复在非所属章节显示高亮的问题",
-				"Fixed highlights being drawn in chapters they do not belong to",
-				"修復在非所屬章節顯示高亮的問題",
-				"Corretto il disegno delle evidenziazioni in capitoli a cui non appartengono"
+				"**修复高亮显示在错误章节。**\n高亮不再被画到不属于它的章节里",
+				"**Highlights drawn in the wrong chapter.**\nA highlight is no longer painted into a chapter it does not belong to",
+				"**修復高亮顯示在錯誤章節。**\n高亮不再被畫到不屬於它的章節裡",
+				"**Evidenziazioni disegnate nel capitolo sbagliato.**\nUn'evidenziazione non viene più disegnata in un capitolo a cui non appartiene"
 			),
 			tr(
-				"重命名或移动书籍、以及重命名其所在文件夹时，高亮记录随之更新",
-				"Highlights follow a book that is renamed or moved, including a rename of the folder containing it",
-				"重新命名或移動書籍、以及重新命名其所在資料夾時，高亮記錄隨之更新",
-				"Le evidenziazioni seguono il libro rinominato o spostato, anche rinominando la cartella che lo contiene"
+				"**重命名或移动书籍不再丢失高亮。**\n包括重命名书籍所在的文件夹",
+				"**Renaming or moving a book keeps its highlights.**\nRenaming the folder that contains it counts too",
+				"**重新命名或移動書籍不再遺失高亮。**\n包括重新命名書籍所在的資料夾",
+				"**Rinominare o spostare un libro conserva le evidenziazioni.**\nVale anche per la cartella che lo contiene"
 			),
 			tr(
-				"点击高亮显示操作栏：更换颜色、编辑备注、复制、删除",
-				"Clicking a highlight opens a menu: change color, edit note, copy, delete",
-				"點擊高亮顯示操作列：更換顏色、編輯備註、複製、刪除",
-				"Facendo clic su un'evidenziazione compare un menu: colore, nota, copia, elimina"
+				"**点击高亮显示操作栏。**\n更换颜色、编辑备注、复制、删除",
+				"**Clicking a highlight opens an action bar.**\nChange the color, edit the note, copy, delete",
+				"**點擊高亮顯示操作列。**\n更換顏色、編輯備註、複製、刪除",
+				"**Il clic su un'evidenziazione apre una barra.**\nCambia colore, modifica la nota, copia, elimina"
 			),
 		],
 	},
@@ -1665,16 +1902,16 @@ const RELEASE_NOTES: { version: string; lines: () => string[] }[] = [
 		version: "0.3.1",
 		lines: () => [
 			tr(
-				"支持自定义导出模板，可用变量编排每条高亮的排版",
-				"Custom export templates, with variables that lay out each highlight",
-				"支援自訂匯出模板，可用變數編排每條高亮的排版",
-				"Modelli di esportazione personalizzati, con variabili per comporre ogni evidenziazione"
+				"**支持自定义导出模板。**\n可用变量编排每条高亮的排版",
+				"**Custom export templates.**\nVariables lay out each highlight the way you want",
+				"**支援自訂匯出模板。**\n可用變數編排每條高亮的排版",
+				"**Modelli di esportazione personalizzati.**\nLe variabili compongono ogni evidenziazione come preferisci"
 			),
 			tr(
-				"改进合并：识别自定义格式、匹配短句；内容完全被涵盖的副本会丢弃，有额外内容的副本保留在文末",
-				"Merging recognises custom formats and matches short highlights; a copy whose content is already covered is dropped, one carrying anything extra is kept at the end of the note",
-				"改進合併：辨識自訂格式、比對短句；內容完全被涵蓋的副本會丟棄，有額外內容的副本保留在文末",
-				"L'unione riconosce i formati personalizzati e abbina le evidenziazioni brevi; una copia già contenuta viene scartata, una con contenuto in più resta in fondo alla nota"
+				"**改进合并。**\n识别自定义格式、匹配短句；内容完全被涵盖的副本会丢弃，有额外内容的副本保留在文末",
+				"**Better merging.**\nCustom formats are recognised and short highlights matched; a copy already contained in another is dropped, one with extra content is kept at the end",
+				"**改進合併。**\n辨識自訂格式、比對短句；內容完全被涵蓋的副本會丟棄，有額外內容的副本保留在文末",
+				"**Unione migliorata.**\nRiconosce i formati personalizzati e abbina le evidenziazioni brevi; una copia già contenuta in un'altra viene scartata, una con contenuto extra resta in fondo"
 			),
 		],
 	},
@@ -1682,16 +1919,16 @@ const RELEASE_NOTES: { version: string; lines: () => string[] }[] = [
 		version: "0.3.0",
 		lines: () => [
 			tr(
-				"导出设置：目标文件夹、分组方式、排序方式、字段开关",
-				"Export settings: target folder, grouping, sort order, field toggles",
-				"匯出設定：目標資料夾、分組方式、排序方式、欄位開關",
-				"Impostazioni di esportazione: cartella, raggruppamento, ordinamento, campi"
+				"**新增导出设置。**\n目标文件夹、分组方式、排序方式、字段开关",
+				"**Export settings.**\nTarget folder, grouping, sort order and field toggles",
+				"**新增匯出設定。**\n目標資料夾、分組方式、排序方式、欄位開關",
+				"**Impostazioni di esportazione.**\nCartella di destinazione, raggruppamento, ordinamento e campi"
 			),
 			tr(
-				"新增合并功能，可将同一本书的多份导出合成一份",
-				"Added merging, folding several exports of one book into a single note",
-				"新增合併功能，可將同一本書的多份匯出合成一份",
-				"Aggiunta l'unione di più esportazioni dello stesso libro in una nota"
+				"**新增合并功能。**\n可将同一本书的多份导出合成一份",
+				"**Merging.**\nSeveral exports of one book can be folded into a single note",
+				"**新增合併功能。**\n可將同一本書的多份匯出合成一份",
+				"**Unione.**\nPiù esportazioni di uno stesso libro possono confluire in una nota"
 			),
 		],
 	},
@@ -1727,8 +1964,24 @@ class WhatsNewModal extends Modal {
 		contentEl.createEl("h3", { text: this.heading, attr: { style: "margin-top: 0;" } });
 		for (const entry of this.entries) {
 			contentEl.createEl("div", { text: entry.version, attr: { style: "font-weight:600; margin-top:8px;" } });
-			const list = contentEl.createEl("ul");
-			for (const line of entry.lines()) list.createEl("li", { text: line, attr: { style: "margin-bottom: 6px;" } });
+			// Numbered, and each line's opening phrase in bold: the list is long
+			// enough that a wall of identical bullets is hard to scan.
+			const list = contentEl.createEl("ol", { attr: { style: "padding-left: 1.4em; margin: 4px 0;" } });
+			for (const line of entry.lines()) {
+				const item = list.createEl("li", { attr: { style: "margin-bottom: 6px;" } });
+				// First line: the bold heading, plus anything that belongs beside it.
+				// The rest becomes a block of its own, which lines up under the
+				// heading rather than under the number.
+				const [head, ...rest] = line.split("\n");
+				const lead = head.match(/^\*\*(.+?)\*\*\s*/);
+				if (lead) {
+					item.createEl("strong", { text: lead[1] });
+					item.appendText(head.slice(lead[0].length));
+				} else {
+					item.appendText(head);
+				}
+				if (rest.length) item.createDiv({ text: rest.join("\n"), attr: { style: "margin-top: 2px;" } });
+			}
 		}
 		const row = contentEl.createDiv({ attr: { style: "margin-top:12px; display:flex; justify-content:flex-end; gap:8px;" } });
 		const guide = row.createEl("button", { text: tr("使用说明", "Quick guide", "使用說明", "Guida rapida") });
@@ -1842,6 +2095,9 @@ function chapterLookup(book: Book) {
 	return {
 		posOf,
 		labelAt,
+		// The label this exact spine item carries in the TOC, with no backfill:
+		// "" means the TOC never mentions it.
+		ownLabelAt: (pos: number) => labelByIndex.get(pos) ?? "",
 		labelOf: (cfi: string) => {
 			const pos = posOf(cfi);
 			return pos >= 0 ? labelAt(pos) : "";
@@ -1865,7 +2121,17 @@ interface ParsedBlock {
 
 const HL_ID_RE = /%%hl:([^%\s]+)%%|<!--\s*hl:([^\s>]+)\s*-->/;
 // "{book} - Highlights[ 2026-08-18 1730]", in any of the four export languages.
+// Exports made before the per-book folders carried the book in the file name.
 const EXPORT_NAME_RE = /^(.*?) - (?:高亮摘录|高亮摘錄|Highlights|Evidenziazioni)(?:\s|$)/;
+// Since then the file is just "Highlights <stamp>" and the folder names the book.
+const EXPORT_STEM_RE = /^(?:高亮摘录|高亮摘錄|Highlights|Evidenziazioni)(?:\s|$)/;
+
+// Which book an exported note belongs to, in either layout. "" = not an export.
+function exportedBookOf(file: TFile): string {
+	const legacy = file.basename.match(EXPORT_NAME_RE);
+	if (legacy) return legacy[1];
+	return EXPORT_STEM_RE.test(file.basename) ? (file.parent?.name ?? "") : "";
+}
 
 // Drop the "# Highlights" + "> N highlights" header the plugin writes itself, so
 // it isn't mistaken for something the reader added.
@@ -1956,11 +2222,11 @@ class MergeExportsModal extends Modal {
 		});
 
 		for (const f of this.app.vault.getMarkdownFiles()) {
-			const m = f.basename.match(EXPORT_NAME_RE);
-			if (!m) continue;
-			const list = this.books.get(m[1]);
+			const book = exportedBookOf(f);
+			if (!book) continue;
+			const list = this.books.get(book);
 			if (list) list.push(f);
-			else this.books.set(m[1], [f]);
+			else this.books.set(book, [f]);
 		}
 		if (this.books.size === 0) {
 			contentEl.createEl("p", {
@@ -2054,14 +2320,11 @@ class MergeExportsModal extends Modal {
 	private async write() {
 		const built = await this.build();
 		if (!built) return;
-		const folder = await this.plugin.ensureExportFolder();
+		const base = await this.plugin.ensureExportFolder();
+		if (base === null) return;
+		const folder = await this.plugin.ensureBookFolder(base, this.stem);
 		if (folder === null) return;
-		const name = tr(
-			`${this.stem} - 高亮摘录 合并`,
-			`${this.stem} - Highlights merged`,
-			`${this.stem} - 高亮摘錄 合併`,
-			`${this.stem} - Evidenziazioni unite`
-		);
+		const name = tr("高亮摘录 合并", "Highlights merged", "高亮摘錄 合併", "Evidenziazioni unite");
 		await this.plugin.writeStampedNote(name, built.md, folder);
 		this.close();
 	}
@@ -2590,6 +2853,128 @@ class ExportSelectModal extends Modal {
 
 // In-book keyword search. Type a term, Enter runs a whole-book search; each
 // result shows an excerpt and jumps the reader there on click.
+// Exports the book's own text, not the highlights: an archive of the source that
+// stays searchable in the vault and can be linked to from notes.
+class BookTextExportModal extends Modal {
+	private view: EpubView;
+	private mode: "single" | "chapters" = "single";
+	private markHighlights = false;
+	private groups: { label: string; indices: number[] }[] = [];
+	private picked = new Set<number>();
+
+	constructor(app: App, view: EpubView) {
+		super(app);
+		this.view = view;
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.setCssStyles({ display: "flex", flexDirection: "column", maxHeight: "72vh" });
+		contentEl.createEl("h3", {
+			text: tr("导出全书正文", "Export book text", "匯出全書正文", "Esporta il testo del libro"),
+			attr: { style: "margin-top: 0; flex-shrink: 0;" },
+		});
+		contentEl.createEl("p", {
+			text: tr(
+				"导出书的正文，不含高亮。图片会被略过，书内链接保留文字。",
+				"Exports the book's own text, without highlights. Images are skipped and internal links keep only their text.",
+				"匯出書的正文，不含高亮。圖片會被略過，書內連結保留文字。",
+				"Esporta il testo del libro, senza evidenziazioni. Le immagini vengono ignorate e i collegamenti interni mantengono solo il testo."
+			),
+			attr: { style: "color: var(--text-muted); font-size: var(--font-ui-small); margin: 0 0 10px; flex-shrink: 0;" },
+		});
+
+		void this.build(contentEl);
+	}
+
+	private async build(contentEl: HTMLElement) {
+		const loading = contentEl.createDiv({
+			text: tr("正在读取章节…", "Reading chapters…", "正在讀取章節…", "Lettura dei capitoli…"),
+			attr: { style: "color: var(--text-muted);" },
+		});
+		this.groups = await this.view.chapterGroups();
+		loading.remove();
+		if (this.groups.length === 0) {
+			contentEl.createEl("p", { text: tr("这本书没有可导出的章节。", "This book has no chapters to export.", "這本書沒有可匯出的章節。", "Nessun capitolo da esportare.") });
+			return;
+		}
+		this.groups.forEach((_, i) => this.picked.add(i));
+
+		new Setting(contentEl)
+			.setName(tr("导出方式", "Layout", "匯出方式", "Struttura"))
+			.addDropdown((dd) => {
+				dd.addOption("single", tr("整本一个文件", "One note for the whole book", "整本一個檔案", "Una nota per tutto il libro"));
+				dd.addOption("chapters", tr("一章一个文件 + 索引", "One note per chapter, plus an index", "一章一個檔案 + 索引", "Una nota per capitolo, più un indice"));
+				dd.setValue(this.mode);
+				dd.onChange((value) => (this.mode = value as "single" | "chapters"));
+			});
+
+		new Setting(contentEl)
+			.setName(tr("标注已高亮的内容", "Mark highlighted passages", "標註已高亮的內容", "Segna i passaggi evidenziati"))
+			.setDesc(
+				tr(
+					"已划线的段落以 == 标出，不含颜色。颜色保留在高亮摘录里。",
+					"Highlighted passages are marked with ==, without color. Color is kept in the highlight export.",
+					"已劃線的段落以 == 標出，不含顏色。顏色保留在高亮摘錄裡。",
+					"I passaggi evidenziati sono contrassegnati con ==, senza colore. Il colore resta nell'esportazione delle evidenziazioni."
+				)
+			)
+			.addToggle((tg) => tg.setValue(this.markHighlights).onChange((value) => (this.markHighlights = value)));
+
+		let exportBtn: HTMLButtonElement;
+		const rowCbs: HTMLInputElement[] = [];
+		const sync = () => {
+			exportBtn.textContent = tr(`导出 (${this.picked.size})`, `Export (${this.picked.size})`, `匯出 (${this.picked.size})`, `Esporta (${this.picked.size})`);
+			exportBtn.disabled = this.picked.size === 0;
+		};
+
+		const filterRow = contentEl.createDiv({ attr: { style: "display:flex; gap:8px; padding:6px 0; flex-shrink:0;" } });
+		filterRow.createEl("button", { text: tr("全部", "All", "全部", "Tutti") }).onclick = () => {
+			this.groups.forEach((_, i) => this.picked.add(i));
+			rowCbs.forEach((cb) => (cb.checked = true));
+			sync();
+		};
+		filterRow.createEl("button", { text: tr("反选", "Invert", "反選", "Inverti") }).onclick = () => {
+			this.groups.forEach((_, i) => (this.picked.has(i) ? this.picked.delete(i) : this.picked.add(i)));
+			rowCbs.forEach((cb, i) => (cb.checked = this.picked.has(i)));
+			sync();
+		};
+
+		const list = contentEl.createDiv({
+			attr: {
+				style:
+					"flex:1; min-height:0; overflow:auto; border-top:1px solid var(--background-modifier-border);" +
+					" border-bottom:1px solid var(--background-modifier-border); padding:4px 0;",
+			},
+		});
+		this.groups.forEach((group, i) => {
+			const row = list.createDiv({ attr: { style: "display:flex; align-items:center; gap:8px; padding:3px 4px;" } });
+			const cb = row.createEl("input", { attr: { type: "checkbox" } });
+			cb.checked = true;
+			cb.onchange = () => {
+				if (cb.checked) this.picked.add(i);
+				else this.picked.delete(i);
+				sync();
+			};
+			rowCbs.push(cb);
+			row.createSpan({ text: group.label });
+		});
+
+		const btnRow = contentEl.createDiv({ attr: { style: "margin-top: 10px; text-align: right; flex-shrink: 0;" } });
+		exportBtn = btnRow.createEl("button", { cls: "mod-cta" });
+		sync();
+		exportBtn.onclick = async () => {
+			const chosen = this.groups.filter((_, i) => this.picked.has(i));
+			this.close();
+			await this.view.exportBookText(this.mode, chosen, this.markHighlights);
+		};
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
 class SearchModal extends Modal {
 	private view: EpubView;
 
@@ -2676,6 +3061,111 @@ function formatQuote(pageLabel: string, timeMs: number, text: string, note: stri
 
 // Where a range starts and ends counted in characters of `root`'s text. Node
 // paths shift the moment spans are unwrapped; character offsets don't.
+// A chapter's body usually opens with its own <h1> of the chapter title, which
+// would sit right under the heading the export adds. Drop the body's copy when
+// it says the same thing; leave anything else alone.
+function dropRepeatedHeading(markdown: string, label: string): string {
+	const match = markdown.match(/^\s*#{1,6}[ \t]+(.+?)[ \t]*(?:\n|$)/);
+	if (!match) return markdown;
+	const bare = (t: string) => t.replace(/[\s*_`]+/g, "");
+	if (bare(match[1]) !== bare(label)) return markdown;
+	return markdown.slice(match[0].length).replace(/^\s+/, "");
+}
+
+// Wrap in Obsidian's == highlight syntax every passage of `texts` found in
+// `markdown`. The highlight was captured from the rendered page while this text
+// came out of the HTML converter, so the two disagree on whitespace and on the
+// emphasis markers Markdown adds; compare with both stripped and map the match
+// back to the original offsets.
+function markHighlightsIn(markdown: string, texts: string[]): { markdown: string; matched: number } {
+	const IGNORED = /[\s*_`\u00ad\u200b-\u200f\ufeff]/;
+	// Markers the converter adds at the start of a line, which the highlight — cap-
+	// tured from the rendered page — never contains.
+	const BLOCK = /^[ \t]*(?:#{1,6}[ \t]+|>[ \t]*|[-*+][ \t]+)/;
+	// An <ol>'s numbers are generated by the list, so they aren't in the highlight
+	// either. But a heading whose text really begins "3. " is not a list, and there
+	// the number has to stay — hence one view with these dropped and one without,
+	// each searched in turn. Only one leading marker is removed per line, so
+	// "#### 3. …" keeps its "3. ".
+	const ORDERED = /^[ \t]*\d+[.)][ \t]+/;
+
+	const view = (dropOrdered: boolean) => {
+		const rawAt: number[] = [];
+		let flat = "";
+		let i = 0;
+		while (i < markdown.length) {
+			if (i === 0 || markdown[i - 1] === "\n") {
+				const rest = markdown.slice(i);
+				const marker = BLOCK.exec(rest) ?? (dropOrdered ? ORDERED.exec(rest) : null);
+				if (marker) {
+					i += marker[0].length;
+					continue;
+				}
+			}
+			if (!IGNORED.test(markdown[i])) {
+				flat += markdown[i];
+				rawAt.push(i);
+			}
+			i++;
+		}
+		return { flat, rawAt };
+	};
+	const views = [view(false), view(true)];
+	const flatten = (t: string) => t.replace(new RegExp(IGNORED.source, "g"), "");
+
+	// Longest first, so a passage that contains a shorter one claims the span.
+	const spans: { start: number; end: number }[] = [];
+	for (const text of [...texts].sort((a, b) => b.length - a.length)) {
+		const needle = flatten(text);
+		if (needle.length < 2) continue;
+		for (const { flat, rawAt } of views) {
+			const at = flat.indexOf(needle);
+			if (at < 0) continue;
+			const start = rawAt[at];
+			const end = rawAt[at + needle.length - 1] + 1;
+			if (spans.some((s) => start < s.end && end > s.start)) break;
+			spans.push({ start, end });
+			break;
+		}
+	}
+	if (spans.length === 0) return { markdown, matched: 0 };
+
+	// == doesn't survive a blank line, so a passage spanning paragraphs is marked
+	// one paragraph at a time.
+	const pieces: { start: number; end: number }[] = [];
+	for (const span of spans) {
+		let offset = span.start;
+		for (const part of markdown.slice(span.start, span.end).split(/\n[ \t]*\n/)) {
+			const from = offset + (part.length - part.replace(/^\s+/, "").length);
+			const to = offset + part.replace(/\s+$/, "").length;
+			if (to > from) pieces.push({ start: from, end: to });
+			offset += part.length + 2;
+		}
+	}
+	// Apply back to front so earlier offsets stay valid.
+	pieces.sort((a, b) => b.start - a.start);
+	let out = markdown;
+	for (const piece of pieces) {
+		out = `${out.slice(0, piece.start)}==${out.slice(piece.start, piece.end)}==${out.slice(piece.end)}`;
+	}
+	return { markdown: out, matched: spans.length };
+}
+
+// Local date-time down to the minute, the suffix that keeps one export from
+// overwriting another.
+function timeStamp(): string {
+	const d = new Date();
+	const pad = (n: number) => `${n}`.padStart(2, "0");
+	return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
+}
+
+// Characters a vault path can't carry, plus leading/trailing dots and spaces
+// that some filesystems quietly strip.
+function safeFileName(name: string): string {
+	const cleaned = name.replace(/[\\/:*?"<>|#^[\]]/g, "-").replace(/\s+/g, " ").trim().replace(/^\.+|\.+$/g, "");
+	return cleaned || "untitled";
+}
+
 function textOffsetsOf(root: Node, range: Range, doc: Document): { start: number; end: number } | null {
 	const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
 	let seen = 0;
@@ -2688,6 +3178,19 @@ function textOffsetsOf(root: Node, range: Range, doc: Document): { start: number
 		seen += len;
 	}
 	return start >= 0 && end > start ? { start, end } : null;
+}
+
+// Boundaries of a painted highlight, expressed on its text nodes rather than
+// around its <span>. Text-node boundaries survive the unwrapping that merging
+// does, and are what textOffsetsOf() can read.
+function edgeTextNode(root: Node, doc: Document, last: boolean): Text | null {
+	const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+	let found: Text | null = null;
+	for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+		found = node as Text;
+		if (!last) break;
+	}
+	return found;
 }
 
 // The inverse, run after the DOM has been rearranged.
@@ -2777,9 +3280,11 @@ class EpubView extends FileView {
 			void this.undo();
 			return;
 		}
-		// Highlight the selection — handled here (not via an Obsidian command hotkey)
-		// so it works while focus is inside the book iframe.
-		if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "h") {
+		// Highlight the selection — matched here rather than through an Obsidian
+		// command hotkey, because Obsidian's dispatch never sees key events from
+		// inside the book's iframe. Configurable in the plugin's settings.
+		const combo = hotkeyString(e);
+		if (combo && combo === (this.plugin.data.prefs.highlightHotkey || DEFAULT_HIGHLIGHT_HOTKEY)) {
 			e.preventDefault();
 			e.stopPropagation();
 			this.highlightCurrentSelection();
@@ -2807,6 +3312,12 @@ class EpubView extends FileView {
 		this.keydownHandler(e);
 	};
 	colorToolbarTs = 0;
+	// Which chapter the popup was raised in. "relocated" fires constantly — the
+	// continuous manager emits it while streaming sections in scroll mode, and
+	// selecting near a column edge nudges the iframe enough to emit one in
+	// paginated mode — so closing on every event made the popup vanish almost as
+	// soon as it appeared. Only a real change of chapter leaves it misplaced.
+	colorToolbarSection = -1;
 	// A click anywhere outside a popup/menu dismisses it (the popup and menu stop
 	// propagation on their own clicks, so those don't reach here). The color popup
 	// is skipped for a moment after opening, because the very mouse-up that
@@ -2922,7 +3433,7 @@ class EpubView extends FileView {
 								const row = menu.createDiv({ cls: "epub-toc-item", text: it.label.trim() });
 								row.setCssStyles({ paddingLeft: `${8 + depth * 14}px` });
 								row.onclick = () => {
-									void this.rendition?.display(it.href);
+									void this.goToTocEntry(it.href);
 									this.closeMenus();
 								};
 								const subs = it.subitems as typeof items | undefined;
@@ -2965,7 +3476,7 @@ class EpubView extends FileView {
 
 				const exportSel = menu.createDiv({ cls: "epub-menu-item" });
 				setIcon(exportSel.createSpan(), "list-checks");
-				exportSel.createSpan({ text: tr("选择导出…", "Export selected…", "選擇匯出…", "Esporta selezionate…") });
+				exportSel.createSpan({ text: tr("高光内容选择导出…", "Choose highlights to export…", "高光內容選擇匯出…", "Scegli le evidenziazioni da esportare…") });
 				exportSel.onclick = () => {
 					this.closeMenus();
 					void this.ensureVisualPages();
@@ -2980,6 +3491,14 @@ class EpubView extends FileView {
 					new Notice(tr("正在导出为 Markdown…", "Exporting to Markdown…", "正在匯出為 Markdown…", "Esportazione in Markdown…"));
 					await this.waitForPagination();
 					await this.plugin.exportHighlights(this.filePath, (cfi) => this.getPageLabel(cfi), undefined, chapterLookup(this.book).labelOf);
+				};
+
+				const exportText = menu.createDiv({ cls: "epub-menu-item" });
+				setIcon(exportText.createSpan(), "book-text");
+				exportText.createSpan({ text: tr("导出全书正文…", "Export book text…", "匯出全書正文…", "Esporta il testo del libro…") });
+				exportText.onclick = () => {
+					this.closeMenus();
+					new BookTextExportModal(this.app, this).open();
 				};
 
 				// Default highlight color for ⌘⇧H / drag-select. Selected one shows a
@@ -3284,6 +3803,174 @@ class EpubView extends FileView {
 		}
 	}
 
+	// The book's chapters as a reader thinks of them. A chapter is often split
+	// across several spine files, and only the first of them carries a TOC label,
+	// so consecutive sections sharing a label are one chapter — and one file when
+	// exported.
+	async chapterGroups(): Promise<{ label: string; indices: number[] }[]> {
+		const spine = (this.book.spine as unknown as { spineItems?: EpubSectionLike[] }).spineItems ?? [];
+		const labels = chapterLookup(this.book);
+		const request = this.book.load.bind(this.book);
+		// The section's own name, for the many spine files a TOC never mentions:
+		// covers, copyright pages, the book's own contents page, and the tail ends
+		// of a chapter split across several files.
+		const ownTitle = async (index: number): Promise<string> => {
+			const section = spine[index];
+			if (!section) return "";
+			try {
+				await section.load(request);
+				const doc = section.document;
+				const title = doc?.querySelector("title")?.textContent?.trim();
+				if (title) return title;
+				return doc?.querySelector("h1, h2, h3, h4, h5, h6")?.textContent?.trim() ?? "";
+			} catch {
+				return "";
+			} finally {
+				section.unload();
+			}
+		};
+		// Whitespace differs freely between a TOC label and the same chapter's own
+		// <title>, and means nothing here.
+		const bare = (t: string) => t.replace(/\s+/g, "");
+
+		const groups: { label: string; indices: number[] }[] = [];
+		for (let i = 0; i < spine.length; i++) {
+			const own = labels.ownLabelAt(i);
+			if (own) {
+				groups.push({ label: own, indices: [i] });
+				continue;
+			}
+			// No TOC entry: either the rest of the chapter before it, or an unrelated
+			// page that merely follows. Its own title tells the two apart — a
+			// continuation repeats the chapter's title, a separate page doesn't.
+			const last = groups[groups.length - 1];
+			const title = await ownTitle(i);
+			if (last && (!title || bare(title) === bare(last.label))) {
+				last.indices.push(i);
+				continue;
+			}
+			groups.push({
+				label: title || tr(`章节 ${i + 1}`, `Chapter ${i + 1}`, `章節 ${i + 1}`, `Capitolo ${i + 1}`),
+				indices: [i],
+			});
+		}
+		return groups;
+	}
+
+	// One chapter's body text as Markdown. Images are dropped and links flattened
+	// to their text: an epub's internal hrefs point at files that don't exist in
+	// the vault, so keeping them would only produce broken links.
+	private async chapterMarkdown(indices: number[]): Promise<string> {
+		const spine = (this.book.spine as unknown as { spineItems?: EpubSectionLike[] }).spineItems ?? [];
+		const request = this.book.load.bind(this.book);
+		const parts: string[] = [];
+		for (const index of indices) {
+			const section = spine[index];
+			if (!section) continue;
+			try {
+				await section.load(request);
+				const doc = section.document;
+				const body = doc?.body ?? doc?.querySelector("body") ?? doc?.documentElement;
+				if (!body) continue;
+				// Convert a copy: the section is shared with the live rendition.
+				const clone = body.cloneNode(true) as HTMLElement;
+				clone.querySelectorAll("img, image, svg, picture, figure, figcaption").forEach((el) => el.remove());
+				clone.querySelectorAll("a[href]").forEach((el) => el.removeAttribute("href"));
+				const md = htmlToMarkdown(clone).trim();
+				if (md) parts.push(md);
+			} catch {
+				// A section that won't parse is skipped rather than failing the export.
+			} finally {
+				section.unload();
+			}
+		}
+		return parts.join("\n\n");
+	}
+
+	// Write the book's text out, either as one note or as a folder of chapters
+	// with an index. Both are stamped with the time, so an export never
+	// overwrites an earlier one.
+	async exportBookText(mode: "single" | "chapters", groups: { label: string; indices: number[] }[], markHighlights = false) {
+		if (groups.length === 0) return;
+		const base = await this.plugin.ensureExportFolder();
+		if (base === null) return;
+		const bookName = this.filePath.split("/").pop()?.replace(/\.epub$/i, "") ?? "epub";
+		const folder = await this.plugin.ensureBookFolder(base, bookName);
+		if (folder === null) return;
+		new Notice(tr("正在导出正文…", "Exporting book text…", "正在匯出正文…", "Esportazione del testo…"));
+
+		// The passages already highlighted in this book, by chapter, so the archive
+		// can show what was marked while reading.
+		const highlights = markHighlights ? this.plugin.getBookRecord(this.filePath).highlights : [];
+		const chapters: { label: string; md: string }[] = [];
+		let marked = 0;
+		for (const group of groups) {
+			let md = await this.chapterMarkdown(group.indices);
+			if (!md) continue;
+			if (highlights.length) {
+				const here = highlights.filter((h) => group.indices.includes(cfiSpinePos(h.cfiRange))).map((h) => h.text);
+				if (here.length) {
+					const result = markHighlightsIn(md, here);
+					md = result.markdown;
+					marked += result.matched;
+				}
+			}
+			chapters.push({ label: group.label, md });
+		}
+		if (chapters.length === 0) {
+			new Notice(tr("没有可导出的正文", "No text to export", "沒有可匯出的正文", "Nessun testo da esportare"));
+			return;
+		}
+
+		// Reported once the file exists, so it isn't buried under the notices the
+		// write itself puts up: a highlight whose wording no longer matches the
+		// converted text is skipped, and that shouldn't happen silently.
+		const reportMarked = () => {
+			if (!markHighlights || highlights.length === 0) return;
+			new Notice(
+				tr(
+					`已标注 ${marked} / ${highlights.length} 条高亮`,
+					`Marked ${marked} of ${highlights.length} highlights`,
+					`已標註 ${marked} / ${highlights.length} 條高亮`,
+					`Segnate ${marked} di ${highlights.length} evidenziazioni`
+				),
+				8000
+			);
+		};
+
+		if (mode === "single") {
+			const body = chapters.map((c) => `## ${c.label}\n\n${dropRepeatedHeading(c.md, c.label)}`).join("\n\n");
+			await this.plugin.writeStampedNote(tr("正文", "Text", "正文", "Testo"), body, folder);
+			reportMarked();
+			return;
+		}
+
+		const stem = safeFileName(tr(`章节选择 ${timeStamp()}`, `Selected chapters ${timeStamp()}`, `章節選擇 ${timeStamp()}`, `Capitoli scelti ${timeStamp()}`));
+		const parent = folder ? `${folder}/` : "";
+		// Two exports in the same minute would otherwise collide on the folder name.
+		let dir = normalizePath(`${parent}${stem}`);
+		for (let n = 2; this.app.vault.getAbstractFileByPath(dir); n++) dir = normalizePath(`${parent}${stem} (${n})`);
+		await this.app.vault.createFolder(dir);
+		const links: string[] = [];
+		// The index takes its name first, so a chapter that happens to share the
+		// book's title is renamed instead of colliding with it.
+		const indexStem = safeFileName(tr("索引", "Index", "索引", "Indice"));
+		const used = new Set<string>([indexStem.toLowerCase()]);
+		for (const chapter of chapters) {
+			// Two chapters can carry the same TOC label; keep both.
+			let stem = safeFileName(chapter.label);
+			for (let n = 2; used.has(stem.toLowerCase()); n++) stem = safeFileName(`${chapter.label} (${n})`);
+			used.add(stem.toLowerCase());
+			await this.app.vault.create(normalizePath(`${dir}/${stem}.md`), chapter.md);
+			links.push(`- [[${dir}/${stem}|${chapter.label}]]`);
+		}
+		// The index carries the reading order, which the folder listing does not.
+		const index = await this.app.vault.create(normalizePath(`${dir}/${indexStem}.md`), links.join("\n"));
+		new Notice(tr(`已导出 ${chapters.length} 章到「${dir}」`, `Exported ${chapters.length} chapters to "${dir}"`, `已匯出 ${chapters.length} 章到「${dir}」`, `Esportati ${chapters.length} capitoli in "${dir}"`));
+		await this.app.workspace.getLeaf(true).openFile(index);
+		reportMarked();
+	}
+
 	// Full-text search across the whole book: load each spine section, run
 	// epub.js's per-section find, then unload it. Returns matches as {cfi, excerpt}.
 	async searchBook(query: string): Promise<{ cfi: string; excerpt: string }[]> {
@@ -3341,6 +4028,50 @@ class EpubView extends FileView {
 		this.openMenuEl = null;
 		this.openMenuAnchor?.removeClass("is-open");
 		this.openMenuAnchor = null;
+	}
+
+	// A TOC href and a spine href routinely disagree: the TOC can be relative to
+	// its own file ("part0.xhtml" vs "Text/part0.xhtml"), URL-encoded, or carry the
+	// OPF folder as a prefix. epub.js only tries the raw string and encodeURI, so
+	// on a good third of real books display(href) resolves to nothing — and the
+	// rejection is silent. Resolve to a spine index the way the export's chapter
+	// naming does.
+	private tocSpineIndex(href: string): number {
+		const bare = href.split("#")[0];
+		const spineItems = (this.book.spine as unknown as { spineItems?: { href: string }[] }).spineItems ?? [];
+		const unescape = (h: string) => {
+			try {
+				return decodeURIComponent(h);
+			} catch {
+				return h;
+			}
+		};
+		const want = unescape(bare);
+		return spineItems.findIndex((sp) => {
+			const sh = unescape(sp.href);
+			return sh === want || sh.endsWith("/" + want) || want.endsWith("/" + sh);
+		});
+	}
+
+	async goToTocEntry(href: string) {
+		const index = this.tocSpineIndex(href);
+		if (index < 0) {
+			new Notice(tr("找不到这一章", "Chapter not found", "找不到這一章", "Capitolo non trovato"));
+			return;
+		}
+		// By index rather than by href: epub.js resolves one as
+		// `spineByHref[href] || spineByHref[encodeURI(href)]`, so a chapter that
+		// happens to be spine item 0 yields a falsy index and fails outright.
+		await this.rendition?.display(index);
+		const fragment = href.split("#")[1];
+		if (!fragment) return;
+		// The section is mounted now, so the anchor can be turned into a CFI, which
+		// display() resolves reliably in either flow.
+		const contents = this.mountedViews().find((v) => v.section?.index === index)?.contents;
+		const anchor = contents?.document.getElementById(fragment);
+		if (!contents || !anchor) return;
+		const cfi = (contents as unknown as { cfiFromNode?(node: Node): string }).cfiFromNode?.(anchor);
+		if (cfi) await this.rendition?.display(cfi);
 	}
 
 	// Jump to a 1-based fixed page number typed into the page box.
@@ -3435,6 +4166,7 @@ class EpubView extends FileView {
 			fontSize: this.fontSize,
 			highlightColor: this.lastColor,
 			customHlHistory: this.plugin.data.prefs.customHlHistory ?? [],
+			highlightHotkey: this.plugin.data.prefs.highlightHotkey,
 		};
 		void this.plugin.saveBookData();
 	}
@@ -3722,8 +4454,12 @@ class EpubView extends FileView {
 
 		this.rendition.on("relocated", () => {
 			this.refreshPageIndicator();
-			// A leftover color popup from the previous page is now misplaced.
-			this.dismissColorToolbar();
+			// A popup left over from another chapter is misplaced; one raised in the
+			// chapter still on screen stays until the reader clicks away.
+			const section = this.currentSectionIndex();
+			if (this.colorToolbar && section >= 0 && this.colorToolbarSection >= 0 && section !== this.colorToolbarSection) {
+				this.dismissColorToolbar();
+			}
 			this.schedulePositionSave();
 		});
 
@@ -3819,7 +4555,15 @@ class EpubView extends FileView {
 		// Cap the image height to the visible reading pane so it always fits on
 		// screen; a portrait cover then becomes height-constrained and shows in
 		// full, naturally centered and sized to its aspect ratio.
-		const maxH = Math.round(this.container.clientHeight * 0.92);
+		//
+		// Paginated mode only. Scroll mode uses epub.js's continuous manager, which
+		// measures each section's height and then stacks the sections at those
+		// offsets — and this runs on "rendered", after the measurement. Shrinking an
+		// image at that point invalidates the offsets the manager just computed and
+		// the view jumps. Nothing is gained in return: a tall image in scroll mode
+		// is simply scrolled past.
+		const maxH = paginated ? Math.round(this.container.clientHeight * 0.92) : 0;
+		const capHeight = maxH > 0 ? `max-height:${maxH}px !important; ` : "";
 		const XLINK = "http://www.w3.org/1999/xlink";
 
 		// epub.js rewrites resource paths to blob: URLs in place, so an <image>
@@ -3839,13 +4583,13 @@ class EpubView extends FileView {
 			img.src = href;
 			// These elements live in the book's iframe document, where Obsidian's
 			// setCssStyles helper isn't on the prototype, so set the attribute.
-			img.setAttribute("style", `display:block; margin:0 auto; max-width:100%; max-height:${maxH}px; width:auto; height:auto;`);
+			img.setAttribute("style", `display:block; margin:0 auto; max-width:100%; ${maxH > 0 ? `max-height:${maxH}px; ` : ""}width:auto; height:auto;`);
 			svg.replaceWith(img);
 		});
 
 		// Inline cover/content images: same contain treatment.
 		doc.querySelectorAll("img").forEach((img) => {
-			img.setAttribute("style", `max-width:100% !important; max-height:${maxH}px !important; width:auto !important; height:auto !important; display:block !important; margin:0 auto !important;`);
+			img.setAttribute("style", `max-width:100% !important; ${capHeight}width:auto !important; height:auto !important; display:block !important; margin:0 auto !important;`);
 		});
 
 		// In paginated mode epub.js lays the body out as CSS columns; force a
@@ -4032,6 +4776,7 @@ class EpubView extends FileView {
 		toolbar.setCssStyles({ top: `${Math.max(top, 0)}px`, left: `${left}px` });
 		this.colorToolbar = toolbar;
 		this.colorToolbarTs = Date.now();
+		this.colorToolbarSection = this.currentSectionIndex();
 
 		for (const c of HIGHLIGHT_COLORS) {
 			const btn = toolbar.createEl("button", {
@@ -4047,11 +4792,29 @@ class EpubView extends FileView {
 				this.dismissColorToolbar();
 			};
 		}
-		// Custom-color swatch: shows the rainbow until a custom color is in use, then
-		// shows that color. Clicking opens the picker and highlights with the choice.
+		// Custom colors already in use get a swatch each, and clicking one highlights
+		// with it straight away. Showing the last custom color on the picker button
+		// instead made that button lie: it looked like a swatch but always reopened
+		// the picker, and the color vanished from the popup as soon as a preset was
+		// used next.
+		for (const value of this.recentCustomColors()) {
+			const btn = toolbar.createEl("button", {
+				attr: {
+					style: `${FLAT_BTN_STYLE} width: 18px; height: 18px; border-radius: 50%; background: ${value};`,
+					title: colorLabel(value),
+				},
+			});
+			btn.onclick = () => {
+				this.lastColor = value;
+				this.createHighlight(cfiRange, text, value, range, contents.document);
+				selection.removeAllRanges();
+				this.dismissColorToolbar();
+			};
+		}
+		// The wheel, for a color not used yet.
 		const custom = toolbar.createEl("button", {
 			attr: {
-				style: `${FLAT_BTN_STYLE} width: 18px; height: 18px; border-radius: 50%; background: ${this.customColorActive() ? this.lastColor : RAINBOW_GRADIENT};`,
+				style: `${FLAT_BTN_STYLE} width: 18px; height: 18px; border-radius: 50%; background: ${RAINBOW_GRADIENT};`,
 				title: tr("自定义颜色…", "Custom color…", "自訂顏色…", "Colore personalizzato…"),
 			},
 		});
@@ -4125,6 +4888,22 @@ class EpubView extends FileView {
 		return !HIGHLIGHT_COLORS.some((c) => c.value === this.lastColor);
 	}
 
+	// Custom colors that deserve a swatch of their own: the ones this book already
+	// uses, most recently highlighted first, then anything mixed in the picker.
+	// Shared by the selection popup and the highlight menu so the two can't drift.
+	private recentCustomColors(limit = 4): string[] {
+		const record = this.plugin.getBookRecord(this.filePath);
+		const used = [...record.highlights].sort((a, b) => b.created - a.created).map((h) => h.color);
+		const picked = (this.plugin.data.prefs.customHlHistory ?? []).map((hex) => hexToHighlightRgba(hex));
+		const out: string[] = [];
+		for (const value of [...used, ...picked]) {
+			if (HIGHLIGHT_COLORS.some((c) => c.value === value)) continue;
+			if (!out.includes(value)) out.push(value);
+			if (out.length >= limit) break;
+		}
+		return out;
+	}
+
 	// The active text selection from whichever mounted section owns it, together
 	// with its range/cfi/document. Shared by the highlight and copy-quote paths.
 	private currentSelection(): { text: string; range: Range; cfiRange: string; doc: Document; selection: Selection } | null {
@@ -4190,6 +4969,11 @@ class EpubView extends FileView {
 		);
 	}
 
+	currentSectionIndex(): number {
+		const loc = (this.rendition as unknown as { location?: { start?: { index?: number } } })?.location;
+		return loc?.start?.index ?? -1;
+	}
+
 	dismissColorToolbar() {
 		this.colorToolbar?.remove();
 		this.colorToolbar = null;
@@ -4210,10 +4994,23 @@ class EpubView extends FileView {
 		let mergedNote = "";
 		const touched = this.highlightsIntersecting(domRange, doc);
 		if (touched.length) {
+			// An overlap keeps the new selection's extent — that is how growing and
+			// trimming a highlight are expressed. A neighbour it merely runs up
+			// against is a different intent: the reader is carrying on through the
+			// same passage, so the two extents join instead of one replacing the
+			// other.
+			const joined = doc.createRange();
+			joined.setStart(domRange.startContainer, domRange.startOffset);
+			joined.setEnd(domRange.endContainer, domRange.endOffset);
+			for (const t of touched) {
+				if (!t.adjacent) continue;
+				if (joined.compareBoundaryPoints(Range.START_TO_START, t.range) > 0) joined.setStart(t.range.startContainer, t.range.startOffset);
+				if (joined.compareBoundaryPoints(Range.END_TO_END, t.range) < 0) joined.setEnd(t.range.endContainer, t.range.endOffset);
+			}
 			// Unwrapping the old spans rearranges the very nodes this range points
-			// into, so hold the selection as character offsets across the chapter and
+			// into, so hold the extent as character offsets across the chapter and
 			// rebuild it once the DOM has settled.
-			const offsets = doc.body ? textOffsetsOf(doc.body, domRange, doc) : null;
+			const offsets = doc.body ? textOffsetsOf(doc.body, joined, doc) : null;
 			const record = this.plugin.getBookRecord(this.filePath);
 			const ids = new Set(touched.map((t) => t.highlight.id));
 			for (const t of touched) {
@@ -4230,7 +5027,18 @@ class EpubView extends FileView {
 				const contents = this.mountedViews().find((v) => v.contents?.document === doc)?.contents;
 				if (contents) cfiRange = contents.cfiFromRange(rebuilt);
 			}
-			if (touched.length > 1) {
+			// ⌘Z puts the originals back, so say what happened rather than merging
+			// silently — a join the reader didn't intend needs to be visible.
+			if (touched.some((t) => t.adjacent)) {
+				new Notice(
+					tr(
+						`已与相邻的高亮合并（${touched.length} 条），⌘Z 可撤销`,
+						`Joined with the adjacent highlight${touched.length > 1 ? "s" : ""} (${touched.length}) — ⌘Z to undo`,
+						`已與相鄰的高亮合併（${touched.length} 條），⌘Z 可復原`,
+						`Unita alle evidenziazioni adiacenti (${touched.length}) — ⌘Z per annullare`
+					)
+				);
+			} else if (touched.length > 1) {
 				new Notice(
 					tr(
 						`已合并 ${touched.length} 条重叠的高亮`,
@@ -4300,10 +5108,21 @@ class EpubView extends FileView {
 		const record = this.plugin.getBookRecord(this.filePath);
 		const highlight = record.highlights.find((h) => h.id === id);
 		if (!highlight) return;
+		// The end of a drag, not a tap: the reader selected text that runs onto this
+		// highlight. Opening the menu here would dismiss the color popup the
+		// selection just raised, and that selection could never be highlighted.
+		const target = ev.target as HTMLElement;
+		const selection = target.ownerDocument.defaultView?.getSelection();
+		if (selection && !selection.isCollapsed && selection.rangeCount > 0) {
+			try {
+				if (selection.getRangeAt(0).intersectsNode(target)) return;
+			} catch {
+				// A selection from another document can't intersect this node.
+			}
+		}
 		ev.stopPropagation();
 		this.dismissColorToolbar();
 
-		const target = ev.target as HTMLElement;
 		const rect = target.getBoundingClientRect();
 		const iframeRect = target.ownerDocument.defaultView?.frameElement?.getBoundingClientRect();
 		const containerRect = this.contentEl.getBoundingClientRect();
@@ -4317,6 +5136,7 @@ class EpubView extends FileView {
 		bar.setCssStyles({ top: `${Math.max(top, 0)}px`, left: `${left}px` });
 		this.colorToolbar = bar;
 		this.colorToolbarTs = Date.now();
+		this.colorToolbarSection = this.currentSectionIndex();
 
 		// Recolour. The swatch matching the current color is marked the same way as
 		// everywhere else in the plugin: a white dot in its centre.
@@ -4335,15 +5155,8 @@ class EpubView extends FileView {
 		for (const c of HIGHLIGHT_COLORS) {
 			swatch(c.value, tr(c.name, c.en, c.tw, c.it), c.value === highlight.color).onclick = () => void applyColor(c.value);
 		}
-		// Custom colors this book already uses, so a palette you built stays reachable
-		// without reopening the picker. Most recently highlighted first: a color just
-		// mixed is the one most likely to be wanted again.
-		const customs = [...record.highlights]
-			.sort((a, b) => b.created - a.created)
-			.map((h) => h.color)
-			.filter((v, i, all) => !HIGHLIGHT_COLORS.some((c) => c.value === v) && all.indexOf(v) === i)
-			.slice(0, 4);
-		for (const value of customs) {
+		// Custom colors already reachable without reopening the picker.
+		for (const value of this.recentCustomColors()) {
 			swatch(value, colorLabel(value), value === highlight.color).onclick = () => void applyColor(value);
 		}
 		// And the wheel, for a color not used yet.
@@ -4387,7 +5200,12 @@ class EpubView extends FileView {
 	}
 
 	// Every painted highlight the given range runs into.
-	private highlightsIntersecting(range: Range, doc: Document): { highlight: Highlight; range: Range }[] {
+	// Everything the new selection runs into: what it overlaps, plus what merely
+	// sits next to it. Continuing a passage — highlighting the next two sentences
+	// right after the first two — reads as one highlight, not two, so a gap of
+	// nothing but whitespace and punctuation still counts as touching. One
+	// character of real text and they stay separate.
+	private highlightsIntersecting(range: Range, doc: Document): { highlight: Highlight; range: Range; adjacent: boolean }[] {
 		const record = this.plugin.getBookRecord(this.filePath);
 		const byId = new Map<string, Element[]>();
 		for (const span of Array.from(doc.querySelectorAll("[data-hl-id]"))) {
@@ -4397,16 +5215,42 @@ class EpubView extends FileView {
 			if (list) list.push(span);
 			else byId.set(id, [span]);
 		}
-		const out: { highlight: Highlight; range: Range }[] = [];
+		// Only whitespace and punctuation may separate two highlights that join.
+		const JOINABLE_GAP = /^[\s\u00ad\u200b-\u200f\ufeff\p{P}]*$/u;
+		const gapIsJoinable = (before: Range, after: Range): boolean => {
+			const gap = doc.createRange();
+			try {
+				gap.setStart(before.endContainer, before.endOffset);
+				gap.setEnd(after.startContainer, after.startOffset);
+			} catch {
+				return false;
+			}
+			const text = gap.toString();
+			return text.length <= 4 && JOINABLE_GAP.test(text);
+		};
+
+		const out: { highlight: Highlight; range: Range; adjacent: boolean }[] = [];
 		for (const [id, spans] of byId) {
 			const highlight = record.highlights.find((h) => h.id === id);
 			if (!highlight) continue;
+			// Text-node boundaries, not setStartBefore/After the spans: merging
+			// unwraps those spans, and only text offsets survive that.
+			const first = edgeTextNode(spans[0], doc, false);
+			const last = edgeTextNode(spans[spans.length - 1], doc, true);
+			if (!first || !last) continue;
 			const other = doc.createRange();
-			other.setStartBefore(spans[0]);
-			other.setEndAfter(spans[spans.length - 1]);
-			if (range.compareBoundaryPoints(Range.END_TO_START, other) >= 0) continue;
-			if (range.compareBoundaryPoints(Range.START_TO_END, other) <= 0) continue;
-			out.push({ highlight, range: other });
+			other.setStart(first, 0);
+			other.setEnd(last, last.textContent?.length ?? 0);
+			const startsAfter = range.compareBoundaryPoints(Range.END_TO_START, other) >= 0;
+			const endsBefore = range.compareBoundaryPoints(Range.START_TO_END, other) <= 0;
+			if (!startsAfter && !endsBefore) {
+				out.push({ highlight, range: other, adjacent: false });
+				continue;
+			}
+			// Disjoint: joins only across a gap of whitespace or punctuation.
+			if (startsAfter ? gapIsJoinable(other, range) : gapIsJoinable(range, other)) {
+				out.push({ highlight, range: other, adjacent: true });
+			}
 		}
 		return out;
 	}
@@ -4455,7 +5299,7 @@ class EpubView extends FileView {
 		const highlight = record.highlights.find((h) => h.id === id);
 		if (!highlight) return;
 
-		new NoteModal(this.app, highlight.note, async (note) => {
+		new NoteModal(this.app, highlight.note, highlight.text, async (note) => {
 			highlight.note = note;
 			await this.plugin.saveBookData();
 			new Notice(tr("笔记已保存", "Note saved", "筆記已儲存", "Nota salvata"));
