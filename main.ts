@@ -796,7 +796,7 @@ export default class EpubReaderPlugin extends Plugin {
 		// avoid showing the name twice.
 		const title = tr("高亮摘录", "Highlights", "高亮摘錄", "Evidenziazioni");
 		const count = tr(`共 ${sorted.length} 条高亮`, `${sorted.length} highlights`, `共 ${sorted.length} 條高亮`, `${sorted.length} evidenziazioni`);
-		const lines: string[] = [`# ${title}`, "", `> ${count}`, ""];
+		const lines: string[] = [`${sourceFrontmatter(path)}# ${title}`, "", `> ${count}`, ""];
 
 		// One group per chapter or color; reading order keeps a single unnamed group.
 		const groups = new Map<string, Highlight[]>();
@@ -1782,6 +1782,41 @@ function toolbarGuide(): { icon?: string; mark?: string; label: string; desc: st
 // is one button away.
 const RELEASE_NOTES: { version: string; lines: () => string[] }[] = [
 	{
+		version: "0.5.1",
+		lines: () => [
+			tr(
+				"**正文导出的空行。**\n书里用作留白的空段落，转换后呈现多余空白部分，现已修正。",
+				"**Blank lines in the exported text.**\nSpacer paragraphs the book uses for whitespace came through as extra blank space. Fixed.",
+				"**正文匯出的空行。**\n書裡用作留白的空段落，轉換後呈現多餘空白部分，現已修正。",
+				"**Righe vuote nel testo esportato.**\nI paragrafi che il libro usa come spaziatura arrivavano come spazio vuoto in eccesso. Corretto."
+			),
+			tr(
+				"**正文导出丢失斜体和粗体。**\n章节按 XML 解析，转换器仅识别标题和段落，导致文字格式丢失，现已修正。",
+				"**Italics and bold lost in the exported text.**\nChapters are parsed as XML and the converter recognised only headings and paragraphs, so inline formatting was lost. Fixed.",
+				"**正文匯出遺失斜體和粗體。**\n章節按 XML 解析，轉換器僅識別標題和段落，導致文字格式遺失，現已修正。",
+				"**Corsivo e grassetto persi nel testo esportato.**\nI capitoli sono analizzati come XML e il convertitore riconosceva solo titoli e paragrafi, perdendo la formattazione in linea. Corretto."
+			),
+			tr(
+				"**导出的笔记在顶部添加链接至原文件。**",
+				"**Exported notes carry a link to the source file at the top.**",
+				"**匯出的筆記在頂部新增連結至原檔案。**",
+				"**Le note esportate riportano in cima un collegamento al file di origine.**"
+			),
+			tr(
+				"**正文只保留文字。**\n样式、脚本、音视频等非文字内容不再进入导出。",
+				"**The text export keeps text only.**\nStyles, scripts, audio and video no longer reach the export.",
+				"**正文只保留文字。**\n樣式、腳本、影音等非文字內容不再進入匯出。",
+				"**L'esportazione del testo conserva solo il testo.**\nStili, script, audio e video non finiscono più nell'esportazione."
+			),
+			tr(
+				"**文件名统一。**\n路径不接受的字符一律换成 _，不再混用横杠和下划线。",
+				"**Consistent file names.**\nEvery character a path can't carry becomes an underscore, instead of a mix of dashes and underscores.",
+				"**檔名統一。**\n路徑不接受的字元一律換成 _，不再混用橫槓和底線。",
+				"**Nomi dei file uniformi.**\nOgni carattere che un percorso non accetta diventa un underscore, invece di un misto di trattini e underscore."
+			),
+		],
+	},
+	{
 		version: "0.5.0",
 		lines: () => [
 			tr(
@@ -2136,7 +2171,9 @@ function exportedBookOf(file: TFile): string {
 // Drop the "# Highlights" + "> N highlights" header the plugin writes itself, so
 // it isn't mistaken for something the reader added.
 function stripGeneratedHeader(text: string): string {
-	return text.replace(/^\s*#\s+[^\n]*\n+(?:>\s*[^\n]*\n+)?/, "");
+	// The source link the export writes is part of the generated header too, and
+	// merging must not carry it into the merged note as if the reader wrote it.
+	return text.replace(/^\s*---\n[\s\S]*?\n---\n+/, "").replace(/^\s*#\s+[^\n]*\n+(?:>\s*[^\n]*\n+)?/, "");
 }
 
 // Split an exported note into its generated blocks and everything the reader put
@@ -2325,7 +2362,10 @@ class MergeExportsModal extends Modal {
 		const folder = await this.plugin.ensureBookFolder(base, this.stem);
 		if (folder === null) return;
 		const name = tr("高亮摘录 合并", "Highlights merged", "高亮摘錄 合併", "Evidenziazioni unite");
-		await this.plugin.writeStampedNote(name, built.md, folder);
+		// The merged note links back to the book too. Only the book's title is known
+		// here (it comes from the notes being merged), so find the epub it names.
+		const book = this.app.vault.getFiles().find((f) => f.extension.toLowerCase() === "epub" && f.basename === this.stem);
+		await this.plugin.writeStampedNote(name, sourceFrontmatter(book?.path ?? "") + built.md, folder);
 		this.close();
 	}
 
@@ -3151,6 +3191,42 @@ function markHighlightsIn(markdown: string, texts: string[]): { markdown: string
 	return { markdown: out, matched: spans.length };
 }
 
+// Books are full of spacer paragraphs — <p>&#160;</p> and the like — which the
+// converter turns into lines holding a single space. They read as content to
+// Markdown, doubling the length of every chapter. Blank is blank.
+function tidyMarkdown(markdown: string): string {
+	const lines = markdown.split("\n").map((line) => {
+		// A line of nothing but spacing is a blank line, whatever it holds.
+		if (!line.trim()) return "";
+		// Exactly two trailing spaces is Markdown's line break; leave it be.
+		if (/[^ \t]  $/.test(line)) return line;
+		return line.replace(/[ \t\u00a0]+$/, "");
+	});
+	let out = lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+	// Books routinely put the space inside the emphasis — <i>will </i>direct —
+	// and "*will *" is not emphasis at all in Markdown: a closing delimiter can't
+	// follow a space, so the asterisks show up as themselves. Move the space out.
+	// Both guards check the opposite side is tight, so "2 * 3 * 4" is left alone.
+	out = out.replace(/(\*{1,2})(?=\S)([^\n*]*?)([ \t]+)\1/g, "$1$2$1$3");
+	out = out.replace(/(\*{1,2})([ \t]+)([^\n*]*?\S)\1/g, "$2$1$3$1");
+	return out;
+}
+
+// Every note the plugin writes opens with a link back to the book it came from,
+// so a chapter or a set of highlights is one click from the epub itself.
+//
+// The link carries the book's title as its display text. That reads better than a
+// full vault path ending in ".epub", it survives the book being moved, and it
+// keeps the link out of the way of attachment managers: those match a note's text
+// against the plain "[[path]]" Obsidian itself would write, and rename the file
+// they find — which would quietly move the reader's book and rename it after this
+// note.
+function sourceFrontmatter(bookPath: string): string {
+	if (!bookPath) return "";
+	const title = bookPath.split("/").pop()?.replace(/\.epub$/i, "") ?? bookPath;
+	return `---\nsource: "[[${bookPath}|${title}]]"\n---\n\n`;
+}
+
 // Local date-time down to the minute, the suffix that keeps one export from
 // overwriting another.
 function timeStamp(): string {
@@ -3162,7 +3238,13 @@ function timeStamp(): string {
 // Characters a vault path can't carry, plus leading/trailing dots and spaces
 // that some filesystems quietly strip.
 function safeFileName(name: string): string {
-	const cleaned = name.replace(/[\\/:*?"<>|#^[\]]/g, "-").replace(/\s+/g, " ").trim().replace(/^\.+|\.+$/g, "");
+	const cleaned = name
+		// One replacement for every character a path can't carry, so a title never
+		// comes back with a mix of dashes and underscores in it.
+		.replace(/[\\/:*?"<>|#^[\]]/g, "_")
+		.replace(/\s+/g, " ")
+		.trim()
+		.replace(/^\.+|\.+$/g, "");
 	return cleaned || "untitled";
 }
 
@@ -3873,10 +3955,22 @@ class EpubView extends FileView {
 				const body = doc?.body ?? doc?.querySelector("body") ?? doc?.documentElement;
 				if (!body) continue;
 				// Convert a copy: the section is shared with the live rendition.
-				const clone = body.cloneNode(true) as HTMLElement;
-				clone.querySelectorAll("img, image, svg, picture, figure, figcaption").forEach((el) => el.remove());
-				clone.querySelectorAll("a[href]").forEach((el) => el.removeAttribute("href"));
-				const md = htmlToMarkdown(clone).trim();
+				const stripped = body.cloneNode(true) as HTMLElement;
+				// Text only: anything that carries styling, scripting or media has no
+				// meaning in a Markdown archive, and some of it would be read as text.
+				stripped
+					.querySelectorAll("img, image, svg, picture, figure, figcaption, style, script, link, meta, noscript, audio, video, iframe, object, embed, source, track, canvas")
+					.forEach((el) => el.remove());
+				stripped.querySelectorAll("a[href]").forEach((el) => el.removeAttribute("href"));
+				// A chapter is parsed as XHTML, so its nodes belong to an XML document
+				// and the converter treats inline tags like <i> as plain containers —
+				// the words survive but the emphasis is lost. Importing them into the
+				// app's own HTML document makes them ordinary HTML elements. Doing it
+				// by serializing and re-parsing would not work: XML self-closing tags
+				// like <span ... /> swallow the rest of the chapter when an HTML
+				// parser meets them.
+				const clone = this.contentEl.ownerDocument.importNode(stripped, true) as HTMLElement;
+				const md = tidyMarkdown(htmlToMarkdown(clone));
 				if (md) parts.push(md);
 			} catch {
 				// A section that won't parse is skipped rather than failing the export.
@@ -3939,7 +4033,9 @@ class EpubView extends FileView {
 		};
 
 		if (mode === "single") {
-			const body = chapters.map((c) => `## ${c.label}\n\n${dropRepeatedHeading(c.md, c.label)}`).join("\n\n");
+			const body =
+				sourceFrontmatter(this.filePath) +
+				chapters.map((c) => `## ${c.label}\n\n${dropRepeatedHeading(c.md, c.label)}`).join("\n\n");
 			await this.plugin.writeStampedNote(tr("正文", "Text", "正文", "Testo"), body, folder);
 			reportMarked();
 			return;
@@ -3961,11 +4057,14 @@ class EpubView extends FileView {
 			let stem = safeFileName(chapter.label);
 			for (let n = 2; used.has(stem.toLowerCase()); n++) stem = safeFileName(`${chapter.label} (${n})`);
 			used.add(stem.toLowerCase());
-			await this.app.vault.create(normalizePath(`${dir}/${stem}.md`), chapter.md);
+			await this.app.vault.create(normalizePath(`${dir}/${stem}.md`), sourceFrontmatter(this.filePath) + chapter.md);
 			links.push(`- [[${dir}/${stem}|${chapter.label}]]`);
 		}
 		// The index carries the reading order, which the folder listing does not.
-		const index = await this.app.vault.create(normalizePath(`${dir}/${indexStem}.md`), links.join("\n"));
+		const index = await this.app.vault.create(
+			normalizePath(`${dir}/${indexStem}.md`),
+			sourceFrontmatter(this.filePath) + links.join("\n")
+		);
 		new Notice(tr(`已导出 ${chapters.length} 章到「${dir}」`, `Exported ${chapters.length} chapters to "${dir}"`, `已匯出 ${chapters.length} 章到「${dir}」`, `Esportati ${chapters.length} capitoli in "${dir}"`));
 		await this.app.workspace.getLeaf(true).openFile(index);
 		reportMarked();
