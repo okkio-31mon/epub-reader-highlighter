@@ -1782,6 +1782,17 @@ function toolbarGuide(): { icon?: string; mark?: string; label: string; desc: st
 // is one button away.
 const RELEASE_NOTES: { version: string; lines: () => string[] }[] = [
 	{
+		version: "0.5.2",
+		lines: () => [
+			tr(
+				"**正文导出的多余标记。**\n文字内容相邻的相同标记现合并为一个。",
+				"**Redundant emphasis marks in the exported text.**\nAdjacent marks of the same kind are now folded into one.",
+				"**正文匯出的多餘標記。**\n文字內容相鄰的相同標記現合併為一個。",
+				"**Segni di enfasi ridondanti nel testo esportato.**\nI segni adiacenti dello stesso tipo vengono ora uniti in uno solo."
+			),
+		],
+	},
+	{
 		version: "0.5.1",
 		lines: () => [
 			tr(
@@ -3191,6 +3202,28 @@ function markHighlightsIn(markdown: string, texts: string[]): { markdown: string
 	return { markdown: out, matched: spans.length };
 }
 
+// Some books wrap every single character in its own <i> or <b>. Converted one by
+// one that becomes "**C****O****P****Y**", which renders more or less right but
+// is unreadable as text and inflates the file. Fold runs of the same tag back
+// into one element before converting. Only immediately adjacent siblings are
+// merged — anything between them, a space included, is left as the book wrote it.
+const MERGEABLE_INLINE = new Set(["I", "EM", "B", "STRONG", "U", "S", "MARK", "SMALL"]);
+
+function mergeAdjacentInline(root: HTMLElement) {
+	for (const tag of MERGEABLE_INLINE) {
+		for (const el of Array.from(root.getElementsByTagName(tag))) {
+			if (!el.parentNode) continue;
+			let next = el.nextSibling;
+			while (next && next.nodeType === Node.ELEMENT_NODE && (next as Element).tagName === tag) {
+				while (next.firstChild) el.appendChild(next.firstChild);
+				const after = next.nextSibling;
+				next.parentNode?.removeChild(next);
+				next = after;
+			}
+		}
+	}
+}
+
 // Books are full of spacer paragraphs — <p>&#160;</p> and the like — which the
 // converter turns into lines holding a single space. They read as content to
 // Markdown, doubling the length of every chapter. Blank is blank.
@@ -3970,6 +4003,7 @@ class EpubView extends FileView {
 				// like <span ... /> swallow the rest of the chapter when an HTML
 				// parser meets them.
 				const clone = this.contentEl.ownerDocument.importNode(stripped, true) as HTMLElement;
+				mergeAdjacentInline(clone);
 				const md = tidyMarkdown(htmlToMarkdown(clone));
 				if (md) parts.push(md);
 			} catch {
