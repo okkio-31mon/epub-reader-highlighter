@@ -43,6 +43,7 @@ interface EpubSectionLike {
 	document?: Document;
 	load(request: unknown): Promise<unknown>;
 	find(query: string): { cfi: string; excerpt: string }[];
+	cfiFromRange(range: Range): string;
 	unload(): void;
 }
 
@@ -796,7 +797,7 @@ export default class EpubReaderPlugin extends Plugin {
 		// avoid showing the name twice.
 		const title = tr("高亮摘录", "Highlights", "高亮摘錄", "Evidenziazioni");
 		const count = tr(`共 ${sorted.length} 条高亮`, `${sorted.length} highlights`, `共 ${sorted.length} 條高亮`, `${sorted.length} evidenziazioni`);
-		const lines: string[] = [`${sourceFrontmatter(path)}# ${title}`, "", `> ${count}`, ""];
+		const lines: string[] = [`${exportFrontmatter(path)}# ${title}`, "", `> ${count}`, ""];
 
 		// One group per chapter or color; reading order keeps a single unnamed group.
 		const groups = new Map<string, Highlight[]>();
@@ -1078,9 +1079,8 @@ export default class EpubReaderPlugin extends Plugin {
 		if (base === null) return;
 		const folder = await this.ensureBookFolder(base, bookName);
 		if (folder === null) return;
-		// The folder already says which book this is.
-		const name = tr("高亮摘录", "Highlights", "高亮摘錄", "Evidenziazioni");
-		await this.writeStampedNote(name, markdown, folder);
+		const name = `${tr("高亮摘录", "Highlights", "高亮摘錄", "Evidenziazioni")}_${bookName}`;
+		await this.writeExportNote(name, markdown, folder);
 	}
 
 	// Everything produced from one book — its highlights, a merge of them, its
@@ -1115,15 +1115,16 @@ export default class EpubReaderPlugin extends Plugin {
 
 	// Every export and every merge lands in its own file, stamped to the minute,
 	// so nothing existing is ever overwritten.
-	async writeStampedNote(name: string, markdown: string, folder: string) {
-		const stem = `${name} ${timeStamp()}`.replace(/[\\/:*?"<>|]/g, "-");
+	async writeExportNote(name: string, markdown: string, folder: string) {
+		const stem = name.replace(/[\\/:*?"<>|]/g, "-");
 		const dir = folder ? `${folder}/` : "";
+		// Exporting the same book twice keeps both: the second one is numbered.
 		let outPath = normalizePath(`${dir}${stem}.md`);
 		for (let n = 2; this.app.vault.getAbstractFileByPath(outPath); n++) {
-			outPath = normalizePath(`${dir}${stem} (${n}).md`);
+			outPath = normalizePath(`${dir}${stem} ${n}.md`);
 		}
 		const file = await this.app.vault.create(outPath, markdown);
-		new Notice(tr(`已导出到「${outPath}」`, `Exported to "${outPath}"`, `已匯出到「${outPath}」`, `Esportato in "${outPath}"`));
+		new Notice(tr(`已导出到「${outPath}」 ✓`, `Exported to "${outPath}" ✓`, `已匯出到「${outPath}」 ✓`, `Esportato in "${outPath}" ✓`));
 		await this.app.workspace.getLeaf(true).openFile(file);
 	}
 
@@ -1133,6 +1134,8 @@ class EpubSettingTab extends PluginSettingTab {
 	plugin: EpubReaderPlugin;
 	// Removes the in-progress shortcut listener; a no-op when none is running.
 	private stopCapture: () => void = () => undefined;
+	// Writes the template box's current text; set while the box is on screen.
+	private flushTemplate?: () => Promise<void>;
 
 	constructor(app: App, plugin: EpubReaderPlugin) {
 		super(app, plugin);
@@ -1142,6 +1145,10 @@ class EpubSettingTab extends PluginSettingTab {
 	hide() {
 		// Leaving the tab mid-capture must not leave a document listener behind.
 		this.stopCapture();
+		// Closing the window detaches the template box without blurring it, so its
+		// last edit would otherwise be lost.
+		void this.flushTemplate?.();
+		this.flushTemplate = undefined;
 		super.hide();
 	}
 
@@ -1408,11 +1415,12 @@ class EpubSettingTab extends PluginSettingTab {
 			ta.inputEl.setCssStyles({ width: "100%", minWidth: "260px", fontFamily: "var(--font-monospace)", fontSize: "12px" });
 			// Saved on blur: writing the whole data file on every keystroke would be
 			// wasteful with a plugin data file this size.
-			ta.inputEl.onblur = async () => {
+			this.flushTemplate = async () => {
 				if (ta.getValue() === ep.template) return;
 				ep.template = ta.getValue();
 				await this.plugin.saveBookData();
 			};
+			ta.inputEl.onblur = () => void this.flushTemplate?.();
 		});
 		// Three labelled blocks: a hanging-indent layout wraps badly in the narrow
 		// settings column, so each part gets its own line.
@@ -1558,8 +1566,66 @@ class NoteModal extends Modal {
 	}
 }
 
+// Paste highlights made somewhere else — another reader, another device, a
+// script — and let the plugin find them in this book.
+class ImportHighlightsModal extends Modal {
+	private view: EpubView;
+
+	constructor(app: App, view: EpubView) {
+		super(app);
+		this.view = view;
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.createEl("h3", { text: tr("导入高亮", "Import highlights", "匯入高亮", "Importa evidenziazioni"), attr: { style: "margin-top: 0;" } });
+		contentEl.createEl("p", {
+			text: tr(
+				"支持两种格式：Markdown 引用块（> 开头为原文，下一行为备注）或 JSON 数组（text / note / color）。本插件导出的高亮摘录可直接粘贴。导入时在当前文档中自动定位。",
+				"Two formats are accepted: Markdown quotes (a line starting with > is the passage, the line below is its note) or a JSON array (text / note / color). A highlight export from this plugin can be pasted as is. Passages are located automatically in the current document.",
+				"支援兩種格式：Markdown 引用區塊（> 開頭為原文，下一行為備註）或 JSON 陣列（text / note / color）。本插件匯出的高亮摘錄可直接貼上。匯入時在目前文件中自動定位。",
+				"Sono accettati due formati: citazioni Markdown (la riga che inizia con > è il passaggio, quella sotto la nota) o un array JSON (text / note / color). Un'esportazione di questo plugin può essere incollata così com'è. I passaggi vengono individuati automaticamente nel documento corrente."
+			),
+			attr: { style: "color: var(--text-muted); font-size: var(--font-ui-small); margin-top: 0;" },
+		});
+		const box = contentEl.createEl("textarea", { attr: { rows: "12", style: "width: 100%; font-family: var(--font-monospace); font-size: 12px;" } });
+		const status = contentEl.createDiv({ attr: { style: "margin-top: 6px; color: var(--text-muted); font-size: var(--font-ui-small);" } });
+		const btnRow = contentEl.createDiv({ attr: { style: "margin-top: 8px; text-align: right;" } });
+		const runBtn = btnRow.createEl("button", { cls: "mod-cta", text: tr("导入", "Import", "匯入", "Importa") });
+
+		// The count is what tells the reader their paste was understood, before
+		// anything is written.
+		const refresh = () => {
+			const n = parseImportedHighlights(box.value).length;
+			status.setText(n ? tr(`识别到 ${n} 条`, `${n} found`, `辨識到 ${n} 條`, `${n} trovate`) : "");
+			runBtn.disabled = n === 0;
+		};
+		box.oninput = refresh;
+		refresh();
+
+		runBtn.onclick = async () => {
+			const items = parseImportedHighlights(box.value);
+			if (!items.length) return;
+			runBtn.disabled = true;
+			status.setText(tr("正在查找…", "Locating…", "正在尋找…", "Ricerca in corso…"));
+			const { added, missed, skipped } = await this.view.importHighlights(items);
+			const parts = [tr(`已导入 ${added} 条 ✓`, `${added} imported ✓`, `已匯入 ${added} 條 ✓`, `${added} importate ✓`)];
+			if (skipped) parts.push(tr(`已存在 ${skipped} 条`, `${skipped} already there`, `已存在 ${skipped} 條`, `${skipped} già presenti`));
+			if (missed) parts.push(tr(`找不到 ${missed} 条`, `${missed} not found`, `找不到 ${missed} 條`, `${missed} non trovate`));
+			new Notice(parts.join(" · "), 8000);
+			this.close();
+		};
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
 class HighlightListModal extends Modal {
 	private view: EpubView;
+	// Set by the count in the heading: show only the highlights carrying a note.
+	private onlyNoted = false;
 
 	constructor(app: App, view: EpubView) {
 		super(app);
@@ -1585,6 +1651,9 @@ class HighlightListModal extends Modal {
 
 		const record = this.view.plugin.getBookRecord(this.view.filePath);
 		const sorted = [...record.highlights].sort((a, b) => a.created - b.created);
+		// Deleting the last noted highlight would otherwise leave the list filtered
+		// down to nothing, with the switch that turns it off gone too.
+		if (!sorted.some((h) => h.note)) this.onlyNoted = false;
 		// How many there are, in the heading — the list scrolls, so counting the
 		// rows isn't an option. Same size and weight as the title, only dimmed, so
 		// it reads as part of the heading rather than a label stuck onto it.
@@ -1592,6 +1661,24 @@ class HighlightListModal extends Modal {
 			// Inherits the heading's own color — whatever the theme paints it — and is
 			// only faded, so the two always match.
 			titleEl.createSpan({ text: ` · ${sorted.length}`, attr: { style: "opacity: 0.45;" } });
+			const noted = sorted.filter((h) => h.note).length;
+			if (noted > 0) {
+				// Clicking it keeps only those, which is the one filter a reader
+				// looking for their own thoughts actually wants.
+				const tab = titleEl.createSpan({
+					text: ` · ${noted} ${tr("条备注", "with notes", "條備註", "con nota")}`,
+					attr: {
+						style: `cursor: pointer; opacity: ${this.onlyNoted ? "1" : "0.45"};`,
+						title: this.onlyNoted
+							? tr("显示全部高亮", "Show all highlights", "顯示全部高亮", "Mostra tutte le evidenziazioni")
+							: tr("只看有备注的", "Show only those with notes", "只看有備註的", "Mostra solo quelle con nota"),
+					},
+				});
+				tab.onclick = () => {
+					this.onlyNoted = !this.onlyNoted;
+					this.render();
+				};
+			}
 		}
 
 		if (sorted.length === 0) {
@@ -1599,7 +1686,8 @@ class HighlightListModal extends Modal {
 			return;
 		}
 
-		for (const h of sorted) {
+		const shown = this.onlyNoted ? sorted.filter((h) => h.note) : sorted;
+		for (const h of shown) {
 			const row = contentEl.createDiv({
 				attr: {
 					style: "display: flex; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--background-modifier-border);",
@@ -1652,6 +1740,7 @@ class HighlightListModal extends Modal {
 			noteBtn.onclick = () => {
 				new NoteModal(this.app, h.note, h.text, async (note) => {
 					h.note = note;
+					this.view.setNoteTooltip(h.id, note);
 					await this.view.plugin.saveBookData();
 					this.render();
 				}).open();
@@ -1668,7 +1757,7 @@ class HighlightListModal extends Modal {
 					await this.view.plugin.saveBookData();
 					this.view.unhighlightInAllViews(h.id);
 					this.render();
-					new Notice(tr("已删除（⌘Z 可撤销）", "Deleted (⌘Z to undo)", "已刪除（⌘Z 可復原）", "Eliminato (⌘Z per annullare)"));
+					new Notice(tr("已删除 ✓（⌘Z 可撤销）", "Deleted ✓ (⌘Z to undo)", "已刪除 ✓（⌘Z 可復原）", "Eliminato ✓ (⌘Z per annullare)"));
 				} catch (err) {
 					console.error("epub-reader-highlighter: failed to delete highlight", err);
 					new Notice(tr(`删除失败：${(err as Error).message}`, `Delete failed: ${(err as Error).message}`, `刪除失敗：${(err as Error).message}`, `Eliminazione non riuscita: ${(err as Error).message}`));
@@ -1679,7 +1768,7 @@ class HighlightListModal extends Modal {
 
 	copy(text: string) {
 		void navigator.clipboard.writeText(text).then(
-			() => new Notice(tr("已复制", "Copied", "已複製", "Copiato")),
+			() => new Notice(tr("已复制 ✓", "Copied ✓", "已複製 ✓", "Copiato ✓")),
 			() => new Notice(tr("复制失败", "Copy failed", "複製失敗", "Copia non riuscita"))
 		);
 	}
@@ -1781,6 +1870,47 @@ function toolbarGuide(): { icon?: string; mark?: string; label: string; desc: st
 // things a reader would otherwise have to discover by accident; the full guide
 // is one button away.
 const RELEASE_NOTES: { version: string; lines: () => string[] }[] = [
+	{
+		version: "0.5.3",
+		lines: () => [
+			tr(
+				"**导入高亮。**\n高亮菜单 →「导入高亮…」。粘贴 Markdown 引用块或 JSON 数组，插件在当前文档中自动定位；本插件导出的高亮摘录 md 文档内容可直接导入。",
+				"**Import highlights.**\nHighlight menu → “Import highlights…”. Paste Markdown quotes or a JSON array and the plugin locates each passage in the current document; a highlight export from this plugin can be pasted as is.",
+				"**匯入高亮。**\n高亮選單 →「匯入高亮…」。貼上 Markdown 引用區塊或 JSON 陣列，插件在目前文件中自動定位；本插件匯出的高亮摘錄 md 檔內容可直接匯入。",
+				"**Importa evidenziazioni.**\nMenu evidenziazioni → «Importa evidenziazioni…». Incolla citazioni Markdown o un array JSON e il plugin individua ogni passaggio nel documento corrente; un'esportazione di questo plugin può essere incollata così com'è."
+			),
+			tr(
+				"**正文导出的章节标题重复，现已修正。**",
+				"**Duplicate chapter titles in the exported text. Fixed.**",
+				"**正文匯出的章節標題重複，現已修正。**",
+				"**Titoli di capitolo duplicati nel testo esportato. Corretto.**"
+			),
+			tr(
+				"**正文导出漏掉部分段落，现已修正。**",
+				"**Some paragraphs were missing from the exported text. Fixed.**",
+				"**正文匯出漏掉部分段落，現已修正。**",
+				"**Alcuni paragrafi mancavano dal testo esportato. Corretto.**"
+			),
+			tr(
+				"**导出文件的命名与归档。**\n文件名带书名、不再带时间戳，重复导出改用序号；索引移到书名文件夹下；新增 exported 属性记录导出时间。",
+				"**Naming and filing of exported notes.**\nFile names carry the book and no longer a timestamp; a repeat export is numbered; the index sits in the book's folder; a new `exported` property records when the note was written.",
+				"**匯出檔案的命名與歸檔。**\n檔名帶書名、不再帶時間戳，重複匯出改用編號；索引移到書名資料夾下；新增 exported 屬性記錄匯出時間。",
+				"**Nomi e collocazione delle note esportate.**\nI nomi dei file portano il libro e non più un timestamp; un'esportazione ripetuta è numerata; l'indice sta nella cartella del libro; una nuova proprietà `exported` registra quando la nota è stata scritta."
+			),
+			tr(
+				"**备注不易察觉。**\n鼠标悬停高亮可显示备注；高亮列表标题显示备注条数，点击后只查看有备注的高亮内容。",
+				"**Notes were easy to miss.**\nHovering a highlight shows its note; the highlight list heading gives the number of notes and filters down to them when clicked.",
+				"**備註不易察覺。**\n滑鼠停在高亮上可顯示備註；高亮清單標題顯示備註條數，點擊後只檢視有備註的高亮內容。",
+				"**Le note passavano inosservate.**\nPassando sopra un'evidenziazione compare la sua nota; l'intestazione dell'elenco indica quante ne esistono e, se cliccata, mostra solo quelle."
+			),
+			tr(
+				"**自定义模板丢失。**\n在模板框输入后直接关闭设置窗口，内容不会保存，现已修正。",
+				"**Custom template lost.**\nText typed into the template box was not saved when the settings window was closed directly. Fixed.",
+				"**自訂模板遺失。**\n在模板框輸入後直接關閉設定視窗，內容不會儲存，現已修正。",
+				"**Modello personalizzato perso.**\nIl testo digitato nel riquadro del modello non veniva salvato chiudendo direttamente la finestra delle impostazioni. Corretto."
+			),
+		],
+	},
 	{
 		version: "0.5.2",
 		lines: () => [
@@ -2170,7 +2300,7 @@ const HL_ID_RE = /%%hl:([^%\s]+)%%|<!--\s*hl:([^\s>]+)\s*-->/;
 // Exports made before the per-book folders carried the book in the file name.
 const EXPORT_NAME_RE = /^(.*?) - (?:高亮摘录|高亮摘錄|Highlights|Evidenziazioni)(?:\s|$)/;
 // Since then the file is just "Highlights <stamp>" and the folder names the book.
-const EXPORT_STEM_RE = /^(?:高亮摘录|高亮摘錄|Highlights|Evidenziazioni)(?:\s|$)/;
+const EXPORT_STEM_RE = /^(?:高亮摘录|高亮摘錄|Highlights|Evidenziazioni)(?:[\s_]|$)/;
 
 // Which book an exported note belongs to, in either layout. "" = not an export.
 function exportedBookOf(file: TFile): string {
@@ -2372,11 +2502,11 @@ class MergeExportsModal extends Modal {
 		if (base === null) return;
 		const folder = await this.plugin.ensureBookFolder(base, this.stem);
 		if (folder === null) return;
-		const name = tr("高亮摘录 合并", "Highlights merged", "高亮摘錄 合併", "Evidenziazioni unite");
+		const name = `${tr("高亮摘录 合并", "Highlights merged", "高亮摘錄 合併", "Evidenziazioni unite")}_${this.stem}`;
 		// The merged note links back to the book too. Only the book's title is known
 		// here (it comes from the notes being merged), so find the epub it names.
 		const book = this.app.vault.getFiles().find((f) => f.extension.toLowerCase() === "epub" && f.basename === this.stem);
-		await this.plugin.writeStampedNote(name, sourceFrontmatter(book?.path ?? "") + built.md, folder);
+		await this.plugin.writeExportNote(name, exportFrontmatter(book?.path ?? "") + built.md, folder);
 		this.close();
 	}
 
@@ -3110,17 +3240,38 @@ function formatQuote(pageLabel: string, timeMs: number, text: string, note: stri
 	return `*${meta}*\n> ${text.replace(/\n+/g, " ")}${noteLine}`;
 }
 
-// Where a range starts and ends counted in characters of `root`'s text. Node
-// paths shift the moment spans are unwrapped; character offsets don't.
-// A chapter's body usually opens with its own <h1> of the chapter title, which
-// would sit right under the heading the export adds. Drop the body's copy when
-// it says the same thing; leave anything else alone.
-function dropRepeatedHeading(markdown: string, label: string): string {
-	const match = markdown.match(/^\s*#{1,6}[ \t]+(.+?)[ \t]*(?:\n|$)/);
-	if (!match) return markdown;
-	const bare = (t: string) => t.replace(/[\s*_`]+/g, "");
-	if (bare(match[1]) !== bare(label)) return markdown;
-	return markdown.slice(match[0].length).replace(/^\s+/, "");
+// One chapter of the single-file export, titled. A chapter that titles itself
+// keeps its own heading and gets none from us; only one that doesn't gets the
+// TOC label. Books also split a title across the layout — <h1>Part One</h1>
+// followed by <p>The Arrest</p> for a TOC label of "Part One: The Arrest" —
+// so when the opening lines add up to exactly the label they are that one
+// title, and the label, being the fuller wording, replaces them.
+function chapterSection(markdown: string, label: string): string {
+	const bare = (t: string) => t.replace(/[\s\p{P}\p{S}]+/gu, "");
+	const want = bare(label);
+	const lines = markdown.split("\n");
+	// The first few lines that carry text, and where each one ends.
+	const head: { bare: string; end: number }[] = [];
+	for (let i = 0; i < lines.length && head.length < 3; i++) {
+		if (!lines[i].trim()) continue;
+		head.push({ bare: bare(lines[i]), end: i + 1 });
+	}
+	const opening = head.length ? lines[head[0].end - 1].match(/^(#{1,6})[ \t]+\S/) : null;
+	let acc = "";
+	for (const line of head) {
+		if (!want) break;
+		acc += line.bare;
+		if (!want.startsWith(acc)) break;
+		// Written at the level the book used, so the chapter's own sub-headings
+		// still nest under it. A book converted from print often marks its titles
+		// with styling alone, and then there is no level to follow.
+		if (acc === want) {
+			const hashes = opening ? opening[1] : "##";
+			return `${hashes} ${label}\n\n${lines.slice(line.end).join("\n").replace(/^\s+/, "")}`;
+		}
+	}
+	if (opening) return markdown;
+	return want ? `## ${label}\n\n${markdown}` : markdown;
 }
 
 // Wrap in Obsidian's == highlight syntax every passage of `texts` found in
@@ -3254,18 +3405,118 @@ function tidyMarkdown(markdown: string): string {
 // against the plain "[[path]]" Obsidian itself would write, and rename the file
 // they find — which would quietly move the reader's book and rename it after this
 // note.
-function sourceFrontmatter(bookPath: string): string {
-	if (!bookPath) return "";
-	const title = bookPath.split("/").pop()?.replace(/\.epub$/i, "") ?? bookPath;
-	return `---\nsource: "[[${bookPath}|${title}]]"\n---\n\n`;
+// One highlight coming in from somewhere else: the passage, and anything the
+// reader wrote about it. Where it sits in the book is not part of this — the
+// plugin finds that itself, so nothing here depends on how highlights are
+// stored.
+interface ImportedHighlight {
+	text: string;
+	note: string;
+	color?: string;
 }
 
-// Local date-time down to the minute, the suffix that keeps one export from
-// overwriting another.
-function timeStamp(): string {
+// Accepts either shape without asking which it is: JSON for a program, Markdown
+// quotes for a person.
+function parseImportedHighlights(raw: string): ImportedHighlight[] {
+	const trimmed = raw.trim();
+	if (!trimmed) return [];
+	return trimmed.startsWith("[") || trimmed.startsWith("{") ? parseImportedJson(trimmed) : parseImportedMarkdown(trimmed);
+}
+
+// [{ "text": "…", "note": "…", "color": "…" }], or the same list under a
+// "highlights" key. Entries without text are skipped rather than failing the lot.
+function parseImportedJson(raw: string): ImportedHighlight[] {
+	let data: unknown;
+	try {
+		data = JSON.parse(raw);
+	} catch {
+		return [];
+	}
+	const list = Array.isArray(data) ? data : (data as { highlights?: unknown })?.highlights;
+	if (!Array.isArray(list)) return [];
+	const out: ImportedHighlight[] = [];
+	for (const entry of list) {
+		const row = entry as { text?: unknown; note?: unknown; color?: unknown };
+		const text = typeof row?.text === "string" ? row.text.trim() : "";
+		if (!text) continue;
+		out.push({
+			text,
+			note: typeof row.note === "string" ? row.note.trim() : "",
+			color: typeof row.color === "string" ? row.color : undefined,
+		});
+	}
+	return out;
+}
+
+// "> quoted passage" is the highlight; plain lines beneath it are its note; a
+// blank line, a separator, or a new quote ends the entry.
+//
+// The plugin's own highlight export is written this way too, so pasting one
+// straight back in has to work — which means recognising the furniture it puts
+// around a passage: the title and count at the top, the "1." in front of the
+// text, the "Note:" label, the italic meta line underneath, the separators.
+function parseImportedMarkdown(raw: string): ImportedHighlight[] {
+	const out: ImportedHighlight[] = [];
+	let quote: string[] = [];
+	let note: string[] = [];
+	const NOTE_LABEL = /^\*{0,2}(?:备注|備註|Note|Nota)[ \t]*[:：]\*{0,2}[ \t]*/;
+	const INDEX = /^\*{0,2}\d+\.\*{0,2}[ \t]+/;
+	// A line that is nothing but italics: the page / date / colour line.
+	const META_ONLY = /^\*[^*]+\*$/;
+	const SEPARATOR = /^(?:-{3,}|\*{3,}|_{3,})$/;
+	// A blank line does not end an entry — the export leaves one between a passage
+	// and its note. It only marks that whatever comes next starts a new block, so
+	// the next quote after one is a new highlight rather than a continuation.
+	let gap = false;
+	const flush = () => {
+		const text = quote.join(" ").replace(/\s+/g, " ").trim();
+		if (text) out.push({ text, note: note.join("\n").replace(NOTE_LABEL, "").trim() });
+		quote = [];
+		note = [];
+		gap = false;
+	};
+	for (const line of stripGeneratedHeader(raw).split("\n")) {
+		const t = line.trim();
+		if (!t) {
+			gap = true;
+			continue;
+		}
+		if (SEPARATOR.test(t)) {
+			flush();
+			continue;
+		}
+		if (t.startsWith(">")) {
+			if (quote.length && gap) flush();
+			const body = t.replace(/^>+[ \t]?/, "");
+			quote.push(quote.length ? body : body.replace(INDEX, ""));
+			gap = false;
+		} else if (quote.length && !META_ONLY.test(t)) {
+			note.push(t);
+			gap = false;
+		}
+	}
+	flush();
+	return out;
+}
+
+// Properties every exported note carries: a link back to the book it came from,
+// and when it was written. The file names are plain, so the time lives here.
+function exportFrontmatter(bookPath: string): string {
+	const lines = ["---"];
+	if (bookPath) {
+		const title = bookPath.split("/").pop()?.replace(/\.epub$/i, "") ?? bookPath;
+		lines.push(`source: "[[${bookPath}|${title}]]"`);
+	}
+	lines.push(`exported: ${exportStamp()}`, "---", "", "");
+	return lines.join("\n");
+}
+
+// Local date-time down to the minute, in the shape Obsidian reads as a datetime
+// property.
+function exportStamp(): string {
 	const d = new Date();
 	const pad = (n: number) => `${n}`.padStart(2, "0");
-	return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
+	return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 // Characters a vault path can't carry, plus leading/trailing dots and spaces
@@ -3608,6 +3859,14 @@ class EpubView extends FileView {
 					await this.plugin.exportHighlights(this.filePath, (cfi) => this.getPageLabel(cfi), undefined, chapterLookup(this.book).labelOf);
 				};
 
+				const importHl = menu.createDiv({ cls: "epub-menu-item" });
+				setIcon(importHl.createSpan(), "download");
+				importHl.createSpan({ text: tr("导入高亮…", "Import highlights…", "匯入高亮…", "Importa evidenziazioni…") });
+				importHl.onclick = () => {
+					this.closeMenus();
+					new ImportHighlightsModal(this.app, this).open();
+				};
+
 				const exportText = menu.createDiv({ cls: "epub-menu-item" });
 				setIcon(exportText.createSpan(), "book-text");
 				exportText.createSpan({ text: tr("导出全书正文…", "Export book text…", "匯出全書正文…", "Esporta il testo del libro…") });
@@ -3633,7 +3892,7 @@ class EpubView extends FileView {
 						this.lastColor = c.value;
 						this.savePrefs();
 						this.closeMenus();
-						new Notice(tr(`默认高光色已设为「${c.name}」`, `Default highlight color: ${c.en}`, `預設高光色已設為「${c.tw}」`, `Colore predefinito: ${c.it}`));
+						new Notice(tr(`默认高光色已设为「${c.name}」 ✓`, `Default highlight color: ${c.en} ✓`, `預設高光色已設為「${c.tw}」 ✓`, `Colore predefinito: ${c.it} ✓`));
 					};
 				}
 				const rainbow = palette.createEl("button", { cls: "epub-swatch-dot", attr: { title: tr("自定义颜色…", "Custom color…", "自訂顏色…", "Colore personalizzato…") } });
@@ -3992,7 +4251,7 @@ class EpubView extends FileView {
 				// Text only: anything that carries styling, scripting or media has no
 				// meaning in a Markdown archive, and some of it would be read as text.
 				stripped
-					.querySelectorAll("img, image, svg, picture, figure, figcaption, style, script, link, meta, noscript, audio, video, iframe, object, embed, source, track, canvas")
+					.querySelectorAll("img, image, svg, picture, style, script, link, meta, noscript, audio, video, iframe, object, embed, source, track, canvas")
 					.forEach((el) => el.remove());
 				stripped.querySelectorAll("a[href]").forEach((el) => el.removeAttribute("href"));
 				// A chapter is parsed as XHTML, so its nodes belong to an XML document
@@ -4068,38 +4327,39 @@ class EpubView extends FileView {
 
 		if (mode === "single") {
 			const body =
-				sourceFrontmatter(this.filePath) +
-				chapters.map((c) => `## ${c.label}\n\n${dropRepeatedHeading(c.md, c.label)}`).join("\n\n");
-			await this.plugin.writeStampedNote(tr("正文", "Text", "正文", "Testo"), body, folder);
+				exportFrontmatter(this.filePath) +
+				chapters.map((c) => chapterSection(c.md, c.label)).join("\n\n");
+			await this.plugin.writeExportNote(`${tr("正文", "Text", "正文", "Testo")}_${bookName}`, body, folder);
 			reportMarked();
 			return;
 		}
 
-		const stem = safeFileName(tr(`章节选择 ${timeStamp()}`, `Selected chapters ${timeStamp()}`, `章節選擇 ${timeStamp()}`, `Capitoli scelti ${timeStamp()}`));
+		const stem = safeFileName(tr("章节选择", "Selected chapters", "章節選擇", "Capitoli scelti"));
 		const parent = folder ? `${folder}/` : "";
-		// Two exports in the same minute would otherwise collide on the folder name.
 		let dir = normalizePath(`${parent}${stem}`);
-		for (let n = 2; this.app.vault.getAbstractFileByPath(dir); n++) dir = normalizePath(`${parent}${stem} (${n})`);
+		for (let n = 2; this.app.vault.getAbstractFileByPath(dir); n++) dir = normalizePath(`${parent}${stem} ${n}`);
 		await this.app.vault.createFolder(dir);
 		const links: string[] = [];
-		// The index takes its name first, so a chapter that happens to share the
-		// book's title is renamed instead of colliding with it.
-		const indexStem = safeFileName(tr("索引", "Index", "索引", "Indice"));
-		const used = new Set<string>([indexStem.toLowerCase()]);
+		const used = new Set<string>();
 		for (const chapter of chapters) {
 			// Two chapters can carry the same TOC label; keep both.
 			let stem = safeFileName(chapter.label);
-			for (let n = 2; used.has(stem.toLowerCase()); n++) stem = safeFileName(`${chapter.label} (${n})`);
+			for (let n = 2; used.has(stem.toLowerCase()); n++) stem = safeFileName(`${chapter.label} ${n}`);
 			used.add(stem.toLowerCase());
-			await this.app.vault.create(normalizePath(`${dir}/${stem}.md`), sourceFrontmatter(this.filePath) + chapter.md);
+			await this.app.vault.create(normalizePath(`${dir}/${stem}.md`), exportFrontmatter(this.filePath) + chapter.md);
 			links.push(`- [[${dir}/${stem}|${chapter.label}]]`);
 		}
 		// The index carries the reading order, which the folder listing does not.
+		// It sits beside the book's other exports rather than inside the chapter
+		// folder, so its name says which book it belongs to.
+		const indexStem = safeFileName(`${tr("索引", "Index", "索引", "Indice")}_${bookName}`);
+		let indexPath = normalizePath(`${parent}${indexStem}.md`);
+		for (let n = 2; this.app.vault.getAbstractFileByPath(indexPath); n++) indexPath = normalizePath(`${parent}${indexStem} ${n}.md`);
 		const index = await this.app.vault.create(
-			normalizePath(`${dir}/${indexStem}.md`),
-			sourceFrontmatter(this.filePath) + links.join("\n")
+			indexPath,
+			exportFrontmatter(this.filePath) + links.join("\n")
 		);
-		new Notice(tr(`已导出 ${chapters.length} 章到「${dir}」`, `Exported ${chapters.length} chapters to "${dir}"`, `已匯出 ${chapters.length} 章到「${dir}」`, `Esportati ${chapters.length} capitoli in "${dir}"`));
+		new Notice(tr(`已导出 ${chapters.length} 章到「${dir}」 ✓`, `Exported ${chapters.length} chapters to "${dir}" ✓`, `已匯出 ${chapters.length} 章到「${dir}」 ✓`, `Esportati ${chapters.length} capitoli in "${dir}" ✓`));
 		await this.app.workspace.getLeaf(true).openFile(index);
 		reportMarked();
 	}
@@ -4777,11 +5037,11 @@ class EpubView extends FileView {
 		if (action.type === "create") {
 			record.highlights = record.highlights.filter((x) => x.id !== action.highlight.id);
 			this.unhighlightInAllViews(action.highlight.id);
-			new Notice(tr("已撤销高亮", "Highlight undone", "已復原高亮", "Evidenziazione annullata"));
+			new Notice(tr("已撤销高亮 ✓", "Highlight undone ✓", "已復原高亮 ✓", "Evidenziazione annullata ✓"));
 		} else {
 			record.highlights.push(action.highlight);
 			this.reapplyAllMountedHighlights();
-			new Notice(tr("已恢复删除的高亮", "Deleted highlight restored", "已還原刪除的高亮", "Evidenziazione ripristinata"));
+			new Notice(tr("已恢复删除的高亮 ✓", "Deleted highlight restored ✓", "已還原刪除的高亮 ✓", "Evidenziazione ripristinata ✓"));
 		}
 		await this.plugin.saveBookData();
 	}
@@ -4796,6 +5056,16 @@ class EpubView extends FileView {
 	reapplyAllMountedHighlights() {
 		for (const view of this.mountedViews()) {
 			if (view?.section) this.applyStoredHighlightsToSection(view.section.index);
+		}
+	}
+
+	// The hover tooltip of a highlight, kept in step with its note.
+	setNoteTooltip(id: string, note: string) {
+		for (const view of this.mountedViews()) {
+			view?.contents?.document?.querySelectorAll(`[data-hl-id="${id}"]`).forEach((span: Element) => {
+				if (note) span.setAttribute("title", note);
+				else span.removeAttribute("title");
+			});
 		}
 	}
 
@@ -4866,9 +5136,87 @@ class EpubView extends FileView {
 				`background: ${h.color}; cursor: pointer;`,
 				(ev) => this.showHighlightMenu(h.id, ev)
 			);
-			spans.forEach((s) => s.setAttribute("data-hl-id", h.id));
+			spans.forEach((s) => {
+				s.setAttribute("data-hl-id", h.id);
+				if (h.note) s.setAttribute("title", h.note);
+			});
 		}
 		if (rehomed) void this.plugin.saveBookData();
+	}
+
+	// An imported passage inside a chapter that isn't on screen. It was typed or
+	// copied elsewhere, so its whitespace won't match the book's character for
+	// character — a quote wrapped over two lines gains a break the book never had,
+	// and in Chinese that break becomes a space between two characters that are
+	// joined. Try it as given, then with whitespace dropped from both sides, and
+	// map the hit back to real offsets.
+	private static rangeForImportedText(body: HTMLElement, text: string, doc: Document): Range | null {
+		const full = body.textContent ?? "";
+		const exact = full.indexOf(text);
+		if (exact >= 0) return rangeFromTextOffsets(body, exact, exact + text.length, doc);
+		const skip = /[\s\u00ad\u200b-\u200f\ufeff]/;
+		const rawAt: number[] = [];
+		let flat = "";
+		for (let i = 0; i < full.length; i++) {
+			if (skip.test(full[i])) continue;
+			flat += full[i];
+			rawAt.push(i);
+		}
+		const wanted = text.replace(new RegExp(skip.source, "g"), "");
+		if (!wanted) return null;
+		const hit = flat.indexOf(wanted);
+		if (hit < 0) return null;
+		return rangeFromTextOffsets(body, rawAt[hit], rawAt[hit + wanted.length - 1] + 1, doc);
+	}
+
+	// Add highlights that came from another reader. Each one is located by its own
+	// text, chapter by chapter, so the caller never has to know what a CFI is.
+	async importHighlights(items: ImportedHighlight[]): Promise<{ added: number; missed: number; skipped: number }> {
+		const record = this.plugin.getBookRecord(this.filePath);
+		const bare = (t: string) => t.replace(/[\s\u00ad\u200b-\u200f\ufeff]+/g, "");
+		const already = new Set(record.highlights.map((h) => bare(h.text)));
+		// Importing the same list twice must not double every highlight.
+		const pending = items.filter((it) => !already.has(bare(it.text)));
+		const spine = (this.book.spine as unknown as { spineItems?: EpubSectionLike[] }).spineItems ?? [];
+		const request = this.book.load.bind(this.book);
+		const found = new Set<number>();
+		for (const section of spine) {
+			if (found.size === pending.length) break;
+			try {
+				await section.load(request);
+				const doc = section.document;
+				const body = doc?.body;
+				if (!doc || !body) continue;
+				for (let i = 0; i < pending.length; i++) {
+					if (found.has(i)) continue;
+					const range = EpubView.rangeForImportedText(body, pending[i].text, doc);
+					if (!range) continue;
+					found.add(i);
+					record.highlights.push({
+						id: `hl-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+						cfiRange: section.cfiFromRange(range),
+						offset: textOffsetsOf(body, range, doc)?.start ?? undefined,
+						// The book's own wording, not the pasted one, so the anchor repair
+						// has something that matches the page exactly.
+						text: range.toString(),
+						color: pending[i].color || this.lastColor,
+						note: pending[i].note,
+						created: Date.now(),
+					});
+				}
+			} catch {
+				// A section that won't load simply holds none of them.
+			} finally {
+				section.unload();
+			}
+		}
+		if (found.size) {
+			await this.plugin.saveBookData();
+			for (const view of this.mountedViews()) {
+				if (view.section) this.applyStoredHighlightsToSection(view.section.index);
+			}
+		}
+		return { added: found.size, missed: pending.length - found.size, skipped: items.length - pending.length };
 	}
 
 	// Find a highlight's passage by its own text, preferring the occurrence closest
@@ -5075,7 +5423,7 @@ class EpubView extends FileView {
 		}
 		const quote = formatQuote(this.getPageLabel(s.cfiRange), Date.now(), s.text, "");
 		void navigator.clipboard.writeText(quote).then(
-			() => new Notice(tr("已复制引用", "Quote copied", "已複製引用", "Citazione copiata")),
+			() => new Notice(tr("已复制引用 ✓", "Quote copied ✓", "已複製引用 ✓", "Citazione copiata ✓")),
 			() => new Notice(tr("复制失败", "Copy failed", "複製失敗", "Copia non riuscita"))
 		);
 	}
@@ -5097,7 +5445,7 @@ class EpubView extends FileView {
 			.map((h) => formatQuote(this.getPageLabel(h.cfiRange), h.created, h.text, h.note))
 			.join("\n\n");
 		void navigator.clipboard.writeText(text).then(
-			() => new Notice(tr(`已复制 ${items.length} 条高亮`, `Copied ${items.length} highlights`, `已複製 ${items.length} 條高亮`, `Copiate ${items.length} evidenziazioni`)),
+			() => new Notice(tr(`已复制 ${items.length} 条高亮 ✓`, `Copied ${items.length} highlights ✓`, `已複製 ${items.length} 條高亮 ✓`, `Copiate ${items.length} evidenziazioni ✓`)),
 			() => new Notice(tr("复制失败", "Copy failed", "複製失敗", "Copia non riuscita"))
 		);
 	}
@@ -5227,7 +5575,7 @@ class EpubView extends FileView {
 			record.highlights.push(highlight);
 			void this.plugin.saveBookData();
 			this.undoStack.push({ type: "create", highlight });
-			new Notice(tr("已高亮（⌘Z 可撤销）", "Highlighted (⌘Z to undo)", "已高亮（⌘Z 可復原）", "Evidenziato (⌘Z per annullare)"));
+			new Notice(tr("已高亮 ✓（⌘Z 可撤销）", "Highlighted ✓ (⌘Z to undo)", "已高亮 ✓（⌘Z 可復原）", "Evidenziato ✓ (⌘Z per annullare)"));
 		} catch (err) {
 			console.error("epub-reader-highlighter: failed to apply highlight", err);
 			new Notice(tr(`高亮失败：${(err as Error).message}`, `Highlight failed: ${(err as Error).message}`, `高亮失敗：${(err as Error).message}`, `Evidenziazione non riuscita: ${(err as Error).message}`));
@@ -5260,14 +5608,16 @@ class EpubView extends FileView {
 		const iframeRect = target.ownerDocument.defaultView?.frameElement?.getBoundingClientRect();
 		const containerRect = this.contentEl.getBoundingClientRect();
 
-		const bar = this.contentEl.createDiv({
-			attr: { style: "position: absolute; z-index: 1000; background: var(--background-secondary); border-radius: 6px; padding: 4px; display: flex; align-items: center; gap: 4px; box-shadow: var(--shadow-s);" },
+		const menu = this.contentEl.createDiv({
+			attr: { style: "position: absolute; z-index: 1000; background: var(--background-secondary); border-radius: 6px; padding: 4px; box-shadow: var(--shadow-s);" },
 		});
-		bar.addEventListener("click", (e) => e.stopPropagation());
-		const top = (iframeRect?.top ?? 0) + rect.top - containerRect.top - 34;
+		menu.addEventListener("click", (e) => e.stopPropagation());
+		const bar = menu.createDiv();
+		bar.setCssStyles({ display: "flex", alignItems: "center", gap: "4px" });
+		const top = (iframeRect?.top ?? 0) + rect.top - containerRect.top - menu.offsetHeight - 6;
 		const left = (iframeRect?.left ?? 0) + rect.left - containerRect.left;
-		bar.setCssStyles({ top: `${Math.max(top, 0)}px`, left: `${left}px` });
-		this.colorToolbar = bar;
+		menu.setCssStyles({ top: `${Math.max(top, 0)}px`, left: `${left}px` });
+		this.colorToolbar = menu;
 		this.colorToolbarTs = Date.now();
 		this.colorToolbarSection = this.currentSectionIndex();
 
@@ -5420,7 +5770,7 @@ class EpubView extends FileView {
 			record.highlights = record.highlights.filter((h) => h.id !== id);
 			await this.plugin.saveBookData();
 			this.unhighlightInAllViews(id);
-			new Notice(tr("已删除（⌘Z 可撤销）", "Deleted (⌘Z to undo)", "已刪除（⌘Z 可復原）", "Eliminato (⌘Z per annullare)"));
+			new Notice(tr("已删除 ✓（⌘Z 可撤销）", "Deleted ✓ (⌘Z to undo)", "已刪除 ✓（⌘Z 可復原）", "Eliminato ✓ (⌘Z per annullare)"));
 		} catch (err) {
 			console.error("epub-reader-highlighter: failed to delete highlight", err);
 			new Notice(tr(`删除失败：${(err as Error).message}`, `Delete failed: ${(err as Error).message}`, `刪除失敗：${(err as Error).message}`, `Eliminazione non riuscita: ${(err as Error).message}`));
@@ -5434,8 +5784,9 @@ class EpubView extends FileView {
 
 		new NoteModal(this.app, highlight.note, highlight.text, async (note) => {
 			highlight.note = note;
+			this.setNoteTooltip(id, note);
 			await this.plugin.saveBookData();
-			new Notice(tr("笔记已保存", "Note saved", "筆記已儲存", "Nota salvata"));
+			new Notice(tr("笔记已保存 ✓", "Note saved ✓", "筆記已儲存 ✓", "Nota salvata ✓"));
 		}).open();
 	}
 

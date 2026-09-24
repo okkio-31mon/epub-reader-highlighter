@@ -16,6 +16,7 @@ Leggi i libri EPUB direttamente dentro Obsidian, annotali con evidenziazioni col
 - **Menu dell'evidenziazione** — fai clic su un'evidenziazione per cambiarne il colore (predefiniti, i colori già usati nel libro o la ruota), scrivere una nota, copiarla o eliminarla sul posto.
 - **Annotazioni nella cassaforte** — le evidenziazioni di ogni libro stanno in un file dentro una cartella che scegli tu, così qualsiasi sincronizzazione le porta con sé e modificare un libro trasferisce solo quel file.
 - **Pannello evidenziazioni** — vedi ogni evidenziazione del libro con numero di pagina, testo e nota; torna al punto originale, modifica le note o elimina.
+- **Importa evidenziazioni** — incolla citazioni Markdown o un array JSON e il plugin trova ogni passaggio nel libro aperto; un'esportazione di questo plugin può essere incollata così com'è.
 - **Copia come citazione** — copia la selezione corrente, o tutte le evidenziazioni insieme, come blocchi `*pagina · ora*` + citazione pronti da incollare in una nota.
 - **Annulla** — `Cmd/Ctrl+Z` annulla l'ultima evidenziazione o eliminazione.
 - **Temi di lettura** — cinque sfondi integrati più un selettore di colore integrato (senza finestre di sistema) per qualsiasi colore personalizzato; carattere e dimensione regolabili; il colore dei link si adatta allo sfondo per restare leggibile.
@@ -85,17 +86,17 @@ Le impostazioni dell'estensione contengono i valori predefiniti: cartella di esp
 
 Attivando **Usa un modello personalizzato** quegli interruttori lasciano il posto a un riquadro in cui decidi la forma di ogni voce: `{{index}}`, `{{text}}`, `{{note}}`, `{{page}}`, `{{chapter}}`, `{{book}}`, `{{date}}`, `{{time}}`, `{{color}}`. Ciò che sta tra `{{#note}}` e `{{/note}}` viene scritto solo se la nota esiste, così le voci senza nota non lasciano etichette vuote. I titoli dei gruppi e il separatore restano all'estensione: l'unione si basa su di essi.
 
-Poiché ogni esportazione è un file a sé con data e ora, un libro letto in più sessioni lascia più note. **Unisci le note di evidenziazioni esportate** (tavolozza dei comandi o pulsante nelle impostazioni) ne fonde quante ne vuoi in una sola: scegli le note, il raggruppamento e l'ordinamento, guarda l'anteprima e il risultato viene scritto in un nuovo file. Le evidenziazioni ripetute restano una volta sola; ciò che non corrisponde a nessuna evidenziazione — quello che hai scritto tu o una citazione che hai modificato — resta sotto «Altri contenuti». Le note di partenza non vengono mai toccate.
+Un'esportazione non sovrascrive mai la precedente — una ripetizione è numerata `Testo 2.md`, `Testo 3.md` — quindi un libro letto in più sessioni lascia più note. Ogni file porta una proprietà `exported` con la data e l'ora in cui è stato scritto. **Unisci le note di evidenziazioni esportate** (tavolozza dei comandi o pulsante nelle impostazioni) ne fonde quante ne vuoi in una sola: scegli le note, il raggruppamento e l'ordinamento, guarda l'anteprima e il risultato viene scritto in un nuovo file. Le evidenziazioni ripetute restano una volta sola; ciò che non corrisponde a nessuna evidenziazione — quello che hai scritto tu o una citazione che hai modificato — resta sotto «Altri contenuti». Le note di partenza non vengono mai toccate.
 
 Tutto ciò che nasce da un libro — le evidenziazioni, una loro unione e il testo — è archiviato in una cartella che porta il nome del libro, dentro la cartella di esportazione:
 
 ```
 <cartella di esportazione>/
 └── <nome del libro>/
-    ├── Evidenziazioni 2026-08-27-1430.md
-    ├── Testo 2026-08-27-1629.md
-    └── Capitoli scelti 2026-08-27-1640/
-        ├── Indice.md
+    ├── Evidenziazioni_<nome del libro>.md
+    ├── Testo_<nome del libro>.md
+    ├── Indice_<nome del libro>.md
+    └── Capitoli scelti/
         └── Capitolo 1….md
 ```
 

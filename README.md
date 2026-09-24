@@ -16,6 +16,7 @@ Read EPUB books directly inside Obsidian, mark them up with color-coded highligh
 - **Highlight menu** — click a highlight to recolor it (presets, the colors this book already uses, or the wheel), write a note, copy it, or delete it, right where it sits.
 - **Annotations stored in your vault** — each book's highlights are one file in a folder you choose, so any sync tool carries them and editing one book transfers only that file.
 - **Highlights panel** — view every highlight in the current book with its page number, text, and note; jump back to the original location, edit notes, or delete.
+- **Import highlights** — paste Markdown quotes or a JSON array and the plugin finds each passage in the open book; a highlight export from this plugin can be pasted as is.
 - **Copy as quote** — copy the current selection, or all highlights at once, as `*page · time*` + quote blocks ready to paste into a note.
 - **Undo** — `Cmd/Ctrl+Z` reverses the last highlight or deletion.
 - **Reading themes** — five built-in backgrounds plus an inline color picker (no OS dialog) for any custom color, adjustable font and font size; link colors adapt to the background for readability.
@@ -90,14 +91,14 @@ Everything produced from one book — its highlights, a merge of them, and its t
 ```
 <export folder>/
 └── <book name>/
-    ├── Highlights 2026-08-27-1430.md
-    ├── Text 2026-08-27-1629.md
-    └── Selected chapters 2026-08-27-1640/
-        ├── Index.md
+    ├── Highlights_<book name>.md
+    ├── Text_<book name>.md
+    ├── Index_<book name>.md
+    └── Selected chapters/
         └── Chapter 1….md
 ```
 
-Because every export is its own timestamped file, a book read over several sittings leaves several notes. **Merge exported highlight notes** (command palette, or the button in the settings) folds any of them into one: choose the notes, the grouping and the sort order, preview the result, and it is written to a new file. Duplicate highlights are kept once; anything that matches no highlight — your own writing, or a quote you edited — is preserved under "Other content". The source notes are never touched.
+An export never overwrites an earlier one — a repeat is numbered `Text 2.md`, `Text 3.md` — so a book read over several sittings leaves several notes. Each one carries an `exported` property with the date and time it was written. **Merge exported highlight notes** (command palette, or the button in the settings) folds any of them into one: choose the notes, the grouping and the sort order, preview the result, and it is written to a new file. Duplicate highlights are kept once; anything that matches no highlight — your own writing, or a quote you edited — is preserved under "Other content". The source notes are never touched.
 
 ## Exporting the book's text
 

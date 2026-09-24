@@ -1,7 +1,7 @@
 {
 	"id": "epub-reader-highlighter",
 	"name": "EPUB Reader and Highlighter",
-	"version": "0.5.2",
+	"version": "0.5.3",
 	"minAppVersion": "1.8.7",
 	"description": "Read EPUB files with persistent, color-coded highlights, notes, and Markdown export.",
 	"author": "Aria",
