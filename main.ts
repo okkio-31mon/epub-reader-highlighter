@@ -145,6 +145,24 @@ function hotkeyLabel(combo: string): string {
 		.join(Platform.isMacOS ? "" : "+");
 }
 
+type ThemeMode = "system" | "light" | "dark";
+
+const DEFAULT_PAGE_WIDTH = 800;
+const MIN_PAGE_WIDTH = 400;
+const MAX_PAGE_WIDTH = 1600;
+const PAGE_WIDTH_STEP = 20;
+const FULL_PAGE_WIDTH = 0;
+const PAGE_WIDTH_FULL_STOP = MAX_PAGE_WIDTH + PAGE_WIDTH_STEP;
+
+function widthToSlider(width: number): number {
+	if (width <= 0) return PAGE_WIDTH_FULL_STOP;
+	return Math.min(Math.max(width, MIN_PAGE_WIDTH), MAX_PAGE_WIDTH);
+}
+
+function sliderToWidth(value: number): number {
+	return value >= PAGE_WIDTH_FULL_STOP ? FULL_PAGE_WIDTH : value;
+}
+
 // Global reading preferences, remembered across books and sessions.
 interface ReadingPrefs {
 	language: string;
@@ -152,6 +170,8 @@ interface ReadingPrefs {
 	customColor: string;
 	fontFamily: string;
 	fontSize: number;
+	pageWidth: number;
+	themeMode?: ThemeMode;
 	// Default highlight color ("" = first preset; set after HIGHLIGHT_COLORS
 	// exists, which is declared below DEFAULT_DATA).
 	highlightColor: string;
@@ -256,7 +276,7 @@ interface PluginData {
 
 const DEFAULT_DATA: PluginData = {
 	books: {},
-	prefs: { language: "auto", bgTheme: "gray", customColor: "#ffffff", fontFamily: "", fontSize: 20, highlightColor: "" },
+	prefs: { language: "auto", bgTheme: "gray", customColor: "#ffffff", fontFamily: "", fontSize: 20, pageWidth: DEFAULT_PAGE_WIDTH, highlightColor: "" },
 	seenGuide: false,
 };
 
@@ -476,6 +496,93 @@ function isLightColor(hex: string): boolean {
 	const g = parseInt(hex.slice(3, 5), 16);
 	const b = parseInt(hex.slice(5, 7), 16);
 	return (r * 299 + g * 587 + b * 114) / 1000 > 150;
+}
+
+interface Hsl {
+	h: number;
+	s: number;
+	l: number;
+}
+
+function toHex6(color: string): string {
+	const m = /^#?([0-9a-f]{6})$/i.exec(color.trim());
+	return m ? `#${m[1].toLowerCase()}` : "#ffffff";
+}
+
+function hexToHsl(hex: string): Hsl {
+	const value = toHex6(hex);
+	const r = parseInt(value.slice(1, 3), 16) / 255;
+	const g = parseInt(value.slice(3, 5), 16) / 255;
+	const b = parseInt(value.slice(5, 7), 16) / 255;
+	const max = Math.max(r, g, b);
+	const min = Math.min(r, g, b);
+	const d = max - min;
+	const l = (max + min) / 2;
+	if (d === 0) return { h: 0, s: 0, l };
+	const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+	const h = max === r ? ((g - b) / d + (g < b ? 6 : 0)) * 60 : max === g ? ((b - r) / d + 2) * 60 : ((r - g) / d + 4) * 60;
+	return { h, s, l };
+}
+
+function hslToHex(h: number, s: number, l: number): string {
+	const hue = (((h % 360) + 360) % 360) / 360;
+	const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+	const p = 2 * l - q;
+	const channel = (t: number) => {
+		const x = ((t % 1) + 1) % 1;
+		if (x < 1 / 6) return p + (q - p) * 6 * x;
+		if (x < 1 / 2) return q;
+		if (x < 2 / 3) return p + (q - p) * (2 / 3 - x) * 6;
+		return p;
+	};
+	const to = (v: number) => Math.round(v * 255).toString(16).padStart(2, "0");
+	return `#${to(channel(hue + 1 / 3))}${to(channel(hue))}${to(channel(hue - 1 / 3))}`;
+}
+
+function nightLightness(dayLightness: number): number {
+	return Math.min(0.135, Math.max(0.045, 0.035 + dayLightness * 0.11));
+}
+
+function nightBackground(hex: string): string {
+	const { h, s, l } = hexToHsl(hex);
+	return hslToHex(h, s < 0.06 ? 0 : Math.min(s * 0.75, 0.3), nightLightness(l));
+}
+
+function nightTextColor(hex: string): string {
+	const { h, s } = hexToHsl(hex);
+	return hslToHex(h, s < 0.06 ? 0 : Math.min(s, 0.22), 0.86);
+}
+
+function nightLinkColor(hex: string): string {
+	const { h, s } = hexToHsl(hex);
+	return hslToHex(h, s < 0.06 ? 0 : Math.min(Math.max(s, 0.35), 0.62), 0.7);
+}
+
+const READING_THEME = "epub-reader-theme";
+
+function readingThemeRules(bg: string, color: string, link: string): Record<string, Record<string, string>> {
+	return {
+		"html, body": {
+			background: `${bg} !important`,
+			color: `${color} !important`,
+			margin: "0 !important",
+			height: "100% !important",
+			"line-height": "1.6 !important",
+		},
+		"a, a:link, a:visited": { color: `${link} !important` },
+		// Scale images/covers to the page width and let height follow the
+		// intrinsic aspect ratio — no stretching, no cropping, no pixel math.
+		"img, image": {
+			"max-width": "100% !important",
+			"width": "auto !important",
+			"height": "auto !important",
+		},
+		svg: {
+			width: "100% !important",
+			"height": "auto !important",
+			"max-width": "100% !important",
+		},
+	};
 }
 
 const FONTS: { name: string; en: string; tw: string; it: string; value: string }[] = [
@@ -3635,6 +3742,7 @@ class EpubView extends FileView {
 	nextBtn: HTMLElement | null = null;
 	thumb: HTMLElement | null = null;
 	bgBtns: { id: string; el: HTMLElement }[] = [];
+	modeBtns: { v: ThemeMode; el: HTMLElement }[] = [];
 	openMenuEl: HTMLElement | null = null;
 	openMenuAnchor: HTMLElement | null = null;
 	// Selection-time highlight-color popup (shown next to selected text).
@@ -3700,6 +3808,9 @@ class EpubView extends FileView {
 	customColor = "#ffffff";
 	fontFamily = "";
 	fontSize = 20;
+	pageWidth = DEFAULT_PAGE_WIDTH;
+	themeMode: ThemeMode = "system";
+	cssChangeBound = false;
 	filePath = "";
 	fontsLoaded = false;
 	// Fixed visual pagination (Apple Books style): the whole book is
@@ -3759,6 +3870,8 @@ class EpubView extends FileView {
 		this.customColor = prefs.customColor;
 		this.fontFamily = prefs.fontFamily;
 		this.fontSize = prefs.fontSize;
+		this.pageWidth = prefs.pageWidth ?? DEFAULT_PAGE_WIDTH;
+		this.themeMode = prefs.themeMode ?? "system";
 		this.lastColor = prefs.highlightColor || HIGHLIGHT_COLORS[0].value;
 		this.contentEl.empty();
 		// empty() removed any open popup/menu nodes; drop their stale references.
@@ -4011,6 +4124,49 @@ class EpubView extends FileView {
 					window.setTimeout(() => void this.ensureVisualPages(), 200);
 				});
 
+				const widthRow = menu.createDiv({ cls: "epub-panel-row" });
+				widthRow.createSpan({ cls: "epub-panel-name", text: tr("页宽", "Page width", "頁寬", "Larghezza pagina") });
+				const widthCtl = widthRow.createDiv({ cls: "epub-panel-ctl epub-width-ctl" });
+				const widthSlider = widthCtl.createEl("input", {
+					attr: {
+						type: "range",
+						min: `${MIN_PAGE_WIDTH}`,
+						max: `${PAGE_WIDTH_FULL_STOP}`,
+						step: `${PAGE_WIDTH_STEP}`,
+					},
+				});
+				widthSlider.value = `${widthToSlider(this.pageWidth)}`;
+				const widthLabel = (width: number) => (width > 0 ? `${width}` : tr("最大", "Max", "最大", "Max"));
+				const widthValue = widthCtl.createSpan({ cls: "epub-panel-value", text: widthLabel(this.pageWidth) });
+				widthSlider.addEventListener("input", () => {
+					widthValue.setText(widthLabel(sliderToWidth(Number(widthSlider.value))));
+				});
+				widthSlider.addEventListener("change", () => {
+					this.pageWidth = sliderToWidth(Number(widthSlider.value));
+					this.applyPageWidth();
+					this.savePrefs();
+					this.onResize();
+				});
+
+				const modeRow = menu.createDiv({ cls: "epub-panel-row" });
+				modeRow.createSpan({ cls: "epub-panel-name", text: tr("外观", "Appearance", "外觀", "Aspetto") });
+				const modeGroup = modeRow.createDiv({ cls: "epub-panel-ctl" }).createDiv({ cls: "epub-mode-ctl" });
+				this.modeBtns = [];
+				for (const opt of [
+					{ v: "system" as ThemeMode, label: tr("跟随系统", "System", "跟隨系統", "Sistema") },
+					{ v: "light" as ThemeMode, label: tr("浅色", "Light", "淺色", "Chiaro") },
+					{ v: "dark" as ThemeMode, label: tr("深色", "Dark", "深色", "Scuro") },
+				]) {
+					const btn = modeGroup.createEl("button", { cls: "epub-mode-btn", text: opt.label });
+					btn.onclick = () => {
+						this.themeMode = opt.v;
+						this.applyTheme();
+						this.savePrefs();
+					};
+					this.modeBtns.push({ v: opt.v, el: btn });
+				}
+				this.markModeActive();
+
 				// Background — name left, color dots right (white center = selected),
 				// spread so the first and last dots align with the other controls.
 				const bgRow = menu.createDiv({ cls: "epub-panel-row" });
@@ -4019,7 +4175,7 @@ class EpubView extends FileView {
 				this.bgBtns = [];
 				for (const t of BG_THEMES) {
 					const btn = bgCtl.createEl("button", { cls: "epub-swatch", attr: { title: tr(t.name, t.en, t.tw, t.it) } });
-					btn.setCssStyles({ background: t.bg });
+					btn.setCssStyles({ background: this.swatchPreview(t.id) });
 					btn.onclick = () => {
 						this.bgTheme = t.id;
 						this.applyTheme();
@@ -4125,6 +4281,17 @@ class EpubView extends FileView {
 		this.container = this.contentEl.createDiv({
 			attr: { style: "flex: 1 1 auto; min-height: 0; width: 100%; overflow: auto;" },
 		});
+		this.applyPageWidth();
+
+		if (!this.cssChangeBound) {
+			this.cssChangeBound = true;
+			this.registerEvent(
+				this.app.workspace.on("css-change", () => {
+					if (this.themeMode !== "system") return;
+					this.applyTheme();
+				})
+			);
+		}
 
 		// Register document-level listeners once (arrows / undo without focus, and
 		// dismissing the color popup on an outside click). registerDomEvent
@@ -4484,53 +4651,18 @@ class EpubView extends FileView {
 
 	applyTheme() {
 		if (!this.rendition) return;
-		for (const t of BG_THEMES) {
-			this.rendition.themes.register(t.id, {
-				"html, body": {
-					background: `${t.bg} !important`,
-					color: `${t.color} !important`,
-					margin: "0 !important",
-					height: "100% !important",
-					"line-height": "1.6 !important",
-				},
-				"a, a:link, a:visited": { color: `${t.link} !important` },
-				// Scale images/covers to the page width and let height follow the
-				// intrinsic aspect ratio — no stretching, no cropping, no pixel math.
-				"img, image": {
-					"max-width": "100% !important",
-					"width": "auto !important",
-					"height": "auto !important",
-				},
-				"svg": {
-					"width": "100% !important",
-					"height": "auto !important",
-					"max-width": "100% !important",
-				},
-			});
-		}
+		const colors = this.bgTheme === "custom" ? this.customColors() : this.themeColors(this.activeTheme());
+		this.rendition.themes.registerRules(READING_THEME, readingThemeRules(colors.bg, colors.color, colors.link));
+		this.clearThemeStylesheets();
+		this.rendition.themes.select(READING_THEME);
 
-		const customTextColor = isLightColor(this.customColor) ? "#333333" : "#f5f5f5";
-		const customLinkColor = isLightColor(this.customColor) ? "#1a73e8" : "#7fb8ff";
-		this.rendition.themes.register("custom", {
-			"html, body": {
-				background: `${this.customColor} !important`,
-				color: `${customTextColor} !important`,
-				margin: "0 !important",
-				height: "100% !important",
-				"line-height": "1.6 !important",
-			},
-			"a, a:link, a:visited": { color: `${customLinkColor} !important` },
-			"img, image": { "max-width": "100% !important", "width": "auto !important", "height": "auto !important" },
-			"svg": { "width": "100% !important", "height": "auto !important", "max-width": "100% !important" },
-		});
-
-		this.rendition.themes.select(this.bgTheme);
 		this.markBgActive();
+		this.markModeActive();
+		this.markBgSwatches();
 		// Fill the reading area (and the view behind it) with the theme color so no
 		// white rounded corners show between/around pages.
-		const activeBg = this.bgTheme === "custom" ? this.customColor : BG_THEMES.find((t) => t.id === this.bgTheme)?.bg ?? "";
-		this.container?.setCssStyles({ background: activeBg });
-		this.contentEl.setCssStyles({ background: activeBg });
+		this.container?.setCssStyles({ background: colors.bg });
+		this.contentEl.setCssStyles({ background: colors.bg });
 		this.applyFont();
 	}
 
@@ -4539,6 +4671,64 @@ class EpubView extends FileView {
 		for (const { id, el } of this.bgBtns) {
 			el.toggleClass("is-active", id === this.bgTheme);
 		}
+	}
+
+	markModeActive() {
+		for (const { v, el } of this.modeBtns) {
+			el.toggleClass("is-active", v === this.themeMode);
+		}
+	}
+
+	activeTheme(): (typeof BG_THEMES)[number] {
+		return BG_THEMES.find((t) => t.id === this.bgTheme) ?? BG_THEMES[0];
+	}
+
+	clearThemeStylesheets() {
+		const id = `epubjs-inserted-css-${READING_THEME}`;
+		for (const view of this.mountedViews()) {
+			view?.contents?.document?.getElementById(id)?.replaceChildren();
+		}
+	}
+
+	isNightMode(): boolean {
+		if (this.themeMode === "dark") return true;
+		if (this.themeMode === "light") return false;
+		return document.body.classList.contains("theme-dark");
+	}
+
+	themeColors(t: (typeof BG_THEMES)[number]): { bg: string; color: string; link: string } {
+		if (!this.isNightMode()) return { bg: t.bg, color: t.color, link: t.link };
+		return { bg: nightBackground(t.bg), color: nightTextColor(t.bg), link: nightLinkColor(t.link) };
+	}
+
+	customColors(): { bg: string; color: string; link: string } {
+		const light = isLightColor(this.customColor);
+		const dayLink = light ? "#1a73e8" : "#7fb8ff";
+		if (!this.isNightMode()) {
+			return { bg: this.customColor, color: light ? "#333333" : "#f5f5f5", link: dayLink };
+		}
+		return { bg: nightBackground(this.customColor), color: nightTextColor(this.customColor), link: nightLinkColor(dayLink) };
+	}
+
+	swatchPreview(id: string): string {
+		const t = BG_THEMES.find((x) => x.id === id);
+		if (!t) return "";
+		return this.isNightMode() ? nightBackground(t.bg) : t.bg;
+	}
+
+	markBgSwatches() {
+		for (const { id, el } of this.bgBtns) {
+			if (id === "custom") continue;
+			el.setCssStyles({ background: this.swatchPreview(id) });
+		}
+	}
+
+	applyPageWidth() {
+		this.container?.setCssStyles({
+			maxWidth: this.pageWidth > 0 ? `${this.pageWidth}px` : "none",
+			marginLeft: "auto",
+			marginRight: "auto",
+		});
 	}
 
 	// Apply the saved font family + size to the current rendition. Called from
@@ -4557,6 +4747,8 @@ class EpubView extends FileView {
 			customColor: this.customColor,
 			fontFamily: this.fontFamily,
 			fontSize: this.fontSize,
+			pageWidth: this.pageWidth,
+			themeMode: this.themeMode,
 			highlightColor: this.lastColor,
 			customHlHistory: this.plugin.data.prefs.customHlHistory ?? [],
 			highlightHotkey: this.plugin.data.prefs.highlightHotkey,
@@ -5049,8 +5241,9 @@ class EpubView extends FileView {
 	// `views()` returns a Views collection (with `.all()`) at runtime, though
 	// epub.js types it as `View[]`; centralize the cast here.
 	mountedViews(): EpubViewLike[] {
-		if (!this.rendition) return [];
-		return (this.rendition.views() as unknown as EpubViewsLike).all();
+		const views = this.rendition?.views() as unknown as EpubViewsLike | EpubViewLike[] | undefined;
+		if (!views) return [];
+		return typeof (views as EpubViewsLike).all === "function" ? (views as EpubViewsLike).all() : (views as EpubViewLike[]);
 	}
 
 	reapplyAllMountedHighlights() {
